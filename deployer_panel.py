@@ -4,8 +4,7 @@ import subprocess
 import threading
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog
-from tkinter import messagebox
+from tkinter import filedialog, messagebox
 
 
 ROOT = Path(__file__).resolve().parent
@@ -15,11 +14,13 @@ LOG_DIR.mkdir(exist_ok=True)
 
 BG = "#050807"
 PANEL = "#0c1512"
+PANEL_2 = "#08100e"
 GREEN = "#39ff88"
 CYAN = "#42d9ff"
 RED = "#ff4d6d"
 YELLOW = "#ffd166"
 TEXT = "#d8ffe8"
+MUTED = "#80a895"
 
 
 def run(args, timeout=25):
@@ -32,7 +33,7 @@ def ps(script, timeout=25):
 
 def load_config():
     if not CONFIG.exists():
-        raise FileNotFoundError(f"No existe {CONFIG}")
+        return {"cloudflared_service": "cloudflared", "apps": []}
     with CONFIG.open("r", encoding="utf-8") as f:
         return json.load(f)
 
@@ -43,10 +44,8 @@ def save_config(config):
 
 
 def slug(text):
-    keep = []
-    for char in text.upper():
-        keep.append(char if char.isalnum() else "_")
-    return "_".join(part for part in "".join(keep).split("_") if part)
+    value = "".join(char if char.isalnum() else "_" for char in text.upper())
+    return "_".join(part for part in value.split("_") if part) or "SERVICIO"
 
 
 def task_exists(name):
@@ -66,9 +65,8 @@ def task_state(name):
 def port_pids(ports):
     if not ports:
         return []
-    port_list = ",".join(str(p) for p in ports)
     script = (
-        f"$ports=@({port_list});"
+        "$ports=@(" + ",".join(str(p) for p in ports) + ");"
         "$ids=@();"
         "foreach($port in $ports){"
         "$ids += Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue | "
@@ -76,8 +74,15 @@ def port_pids(ports):
         "};"
         "$ids | Where-Object {$_ -gt 0} | Sort-Object -Unique"
     )
-    out = ps(script).stdout
-    return [x.strip() for x in out.splitlines() if x.strip().isdigit()]
+    return [x.strip() for x in ps(script).stdout.splitlines() if x.strip().isdigit()]
+
+
+def port_statuses(ports):
+    result = []
+    for port in ports:
+        ok = ps(f"if(Get-NetTCPConnection -State Listen -LocalPort {port} -ErrorAction SilentlyContinue){{'OK'}}").stdout.strip()
+        result.append((port, bool(ok)))
+    return result
 
 
 def process_metrics(pids):
@@ -93,20 +98,6 @@ def process_metrics(pids):
     return ps(script).stdout.strip() or "CPU -- | RAM --"
 
 
-def ports_text(ports):
-    if not ports:
-        return "-"
-    live = set()
-    for pid in port_pids(ports):
-        if pid:
-            live.add(pid)
-    status = []
-    for port in ports:
-        ok = ps(f"if(Get-NetTCPConnection -State Listen -LocalPort {port} -ErrorAction SilentlyContinue){{'OK'}}").stdout.strip()
-        status.append(f"{port}:{'OK' if ok else '--'}")
-    return "  ".join(status)
-
-
 def latest_log(path):
     p = Path(path)
     if p.is_file():
@@ -117,12 +108,21 @@ def latest_log(path):
     return max(files, key=lambda x: x.stat().st_mtime) if files else None
 
 
+def read_tail(path, lines=120):
+    log = latest_log(path)
+    if not log:
+        return None, "No encontre logs para este sistema."
+    try:
+        text = log.read_text(encoding="utf-8", errors="replace").splitlines()[-lines:]
+        return log, "\n".join(text)
+    except OSError as exc:
+        return log, f"No pude leer {log}: {exc}"
+
+
 def create_task(app):
     task = app["task"]
-    cwd = app["cwd"]
-    bat = app["bat"]
     log = LOG_DIR / f"{task}.log"
-    command = f'cd /d "{cwd}" && call "{bat}" >> "{log}" 2>&1'
+    command = f'cd /d "{app["cwd"]}" && call "{app["bat"]}" >> "{log}" 2>&1'
     script = (
         f"$action=New-ScheduledTaskAction -Execute 'cmd.exe' -Argument '/d /c {command}';"
         "$settings=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries "
@@ -138,20 +138,30 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Deployer Panel")
-        self.geometry("1180x720")
+        self.geometry("1260x780")
         self.configure(bg=BG)
         self.q = queue.Queue()
         self.config_data = load_config()
         self.cards = {}
+        self.selected_log = None
+        self.auto_refresh = tk.BooleanVar(value=True)
         self.build()
         self.refresh()
         self.after(500, self.drain)
+        self.after(5000, self.auto_tick)
 
     def build(self):
         top = tk.Frame(self, bg=BG)
         top.pack(fill="x", padx=18, pady=14)
-        tk.Label(top, text="DEPLOYER PANEL", fg=GREEN, bg=BG, font=("Consolas", 24, "bold")).pack(side="left")
-        tk.Button(top, text="Instalar control automatico", command=self.install_all, bg=PANEL, fg=CYAN).pack(side="right", padx=6)
+        Logo(top).pack(side="left", padx=(0, 12))
+        title_box = tk.Frame(top, bg=BG)
+        title_box.pack(side="left")
+        tk.Label(title_box, text="DEPLOYER // OPS CONTROL", fg=GREEN, bg=BG, font=("Consolas", 24, "bold")).pack(anchor="w")
+        self.summary = tk.Label(title_box, text="escaneando sistemas...", fg=MUTED, bg=BG, font=("Consolas", 10))
+        self.summary.pack(anchor="w")
+
+        tk.Checkbutton(top, text="Auto", variable=self.auto_refresh, bg=BG, fg=TEXT, selectcolor=PANEL, activebackground=BG).pack(side="right", padx=6)
+        tk.Button(top, text="Instalar todo", command=self.install_all, bg=PANEL, fg=CYAN).pack(side="right", padx=6)
         tk.Button(top, text="Agregar servicio", command=self.add_service, bg=PANEL, fg=CYAN).pack(side="right", padx=6)
         tk.Button(top, text="Refrescar", command=self.refresh, bg=PANEL, fg=GREEN).pack(side="right", padx=6)
 
@@ -159,9 +169,23 @@ class App(tk.Tk):
         self.grid.pack(fill="both", expand=True, padx=18)
         self.render_cards()
 
-        tk.Label(self, text="EVENTOS", fg=CYAN, bg=BG, font=("Consolas", 11, "bold")).pack(anchor="w", padx=20)
-        self.events = tk.Text(self, height=8, bg="#020403", fg=TEXT, insertbackground=GREEN, font=("Consolas", 10))
-        self.events.pack(fill="x", padx=18, pady=(2, 14))
+        bottom = tk.Frame(self, bg=BG)
+        bottom.pack(fill="x", padx=18, pady=(2, 14))
+        left = tk.Frame(bottom, bg=BG)
+        left.pack(side="left", fill="both", expand=True, padx=(0, 8))
+        right = tk.Frame(bottom, bg=BG)
+        right.pack(side="left", fill="both", expand=True, padx=(8, 0))
+
+        tk.Label(left, text="EVENTOS", fg=CYAN, bg=BG, font=("Consolas", 11, "bold")).pack(anchor="w")
+        self.events = tk.Text(left, height=8, bg="#020403", fg=TEXT, insertbackground=GREEN, font=("Consolas", 10))
+        self.events.pack(fill="both", expand=True)
+
+        log_top = tk.Frame(right, bg=BG)
+        log_top.pack(fill="x")
+        tk.Label(log_top, text="LOGS", fg=CYAN, bg=BG, font=("Consolas", 11, "bold")).pack(side="left")
+        tk.Button(log_top, text="Actualizar log", command=self.refresh_log, bg=PANEL, fg=GREEN).pack(side="right")
+        self.log_view = tk.Text(right, height=8, bg="#020403", fg=TEXT, insertbackground=GREEN, font=("Consolas", 10))
+        self.log_view.pack(fill="both", expand=True)
 
     def render_cards(self):
         for child in self.grid.winfo_children():
@@ -172,9 +196,8 @@ class App(tk.Tk):
             card.grid(row=i // 2, column=i % 2, sticky="nsew", padx=8, pady=8)
             self.cards[app["key"]] = card
         row = (len(self.config_data["apps"]) + 1) // 2
-        cloud = CloudCard(self.grid, self, self.config_data.get("cloudflared_service", "cloudflared"))
-        cloud.grid(row=row, column=0, columnspan=2, sticky="nsew", padx=8, pady=8)
-        self.cloud = cloud
+        self.cloud = CloudCard(self.grid, self, self.config_data.get("cloudflared_service", "cloudflared"))
+        self.cloud.grid(row=row, column=0, columnspan=2, sticky="nsew", padx=8, pady=8)
         self.grid.columnconfigure(0, weight=1)
         self.grid.columnconfigure(1, weight=1)
 
@@ -198,10 +221,34 @@ class App(tk.Tk):
             self.refresh()
         self.after(500, self.drain)
 
+    def auto_tick(self):
+        if self.auto_refresh.get():
+            self.refresh()
+            self.refresh_log()
+        self.after(5000, self.auto_tick)
+
     def refresh(self):
+        active = ports_ok = total_ports = missing = 0
         for card in self.cards.values():
-            card.refresh()
+            state = card.refresh()
+            active += int(state["active"])
+            missing += int(state["missing"])
+            ports_ok += state["ports_ok"]
+            total_ports += state["ports_total"]
         self.cloud.refresh()
+        self.summary.configure(text=f"{active}/{len(self.cards)} activos  |  {ports_ok}/{total_ports} puertos OK  |  {missing} BAT faltantes")
+
+    def refresh_log(self):
+        if not self.selected_log:
+            return
+        log, text = read_tail(self.selected_log)
+        self.log_view.delete("1.0", "end")
+        self.log_view.insert("end", f"{log or self.selected_log}\n" + "-" * 70 + "\n" + text)
+        self.log_view.see("end")
+
+    def show_logs(self, app):
+        self.selected_log = app.get("logs", "")
+        self.refresh_log()
 
     def install_all(self):
         def work():
@@ -212,40 +259,79 @@ class App(tk.Tk):
             return "[OK] Tareas programadas instaladas/actualizadas."
         self.bg(work)
 
+    def install_one(self, app):
+        self.bg(lambda: self._install_one(app))
+
+    def _install_one(self, app):
+        if not Path(app["bat"]).exists():
+            return f"[ERROR] No existe: {app['bat']}"
+        create_task(app)
+        return f"[OK] Tarea instalada: {app['task']}"
+
     def add_service(self):
         ServiceDialog(self)
 
-    def save_new_service(self, app):
-        self.config_data["apps"].append(app)
+    def edit_service(self, app):
+        ServiceDialog(self, app)
+
+    def save_service(self, app, old_key=None):
+        if old_key:
+            self.config_data["apps"] = [app if x["key"] == old_key else x for x in self.config_data["apps"]]
+            action = "editado"
+        else:
+            self.config_data["apps"].append(app)
+            action = "agregado"
         save_config(self.config_data)
         self.render_cards()
         self.refresh()
-        self.log(f"[OK] Servicio agregado: {app['name']}")
+        self.log(f"[OK] Servicio {action}: {app['name']}")
+
+    def delete_service(self, app):
+        if not messagebox.askyesno("Eliminar servicio", f"Quitar {app['name']} del panel?"):
+            return
+        self.config_data["apps"] = [x for x in self.config_data["apps"] if x["key"] != app["key"]]
+        save_config(self.config_data)
+        self.render_cards()
+        self.refresh()
+        self.log(f"[OK] Servicio eliminado del panel: {app['name']}")
+
+
+class Logo(tk.Canvas):
+    def __init__(self, parent):
+        super().__init__(parent, width=72, height=72, bg=BG, highlightthickness=0)
+        self.create_oval(5, 5, 67, 67, outline=GREEN, width=2)
+        self.create_oval(14, 14, 58, 58, outline=CYAN, width=1)
+        self.create_line(36, 10, 36, 62, fill=GREEN, width=2)
+        self.create_line(10, 36, 62, 36, fill=CYAN, width=2)
+        self.create_polygon(36, 18, 49, 49, 36, 42, 23, 49, fill="", outline=GREEN, width=2)
+        self.create_text(36, 36, text="D", fill=TEXT, font=("Consolas", 20, "bold"))
 
 
 class ServiceDialog(tk.Toplevel):
-    def __init__(self, app_ui):
+    def __init__(self, app_ui, app=None):
         super().__init__(app_ui)
         self.app_ui = app_ui
-        self.title("Agregar servicio")
+        self.old_key = app["key"] if app else None
+        self.title("Editar servicio" if app else "Agregar servicio")
         self.configure(bg=BG)
         self.resizable(False, False)
         self.fields = {}
-        rows = [
-            ("Nombre", "name"),
-            ("BAT", "bat"),
-            ("Carpeta", "cwd"),
-            ("Puertos", "ports"),
-            ("Logs", "logs"),
-        ]
+        rows = [("Nombre", "name"), ("BAT", "bat"), ("Carpeta", "cwd"), ("Puertos", "ports"), ("Logs", "logs")]
         for i, (label, key) in enumerate(rows):
             tk.Label(self, text=label, fg=TEXT, bg=BG, font=("Consolas", 10)).grid(row=i, column=0, sticky="w", padx=12, pady=6)
-            entry = tk.Entry(self, width=58, bg=PANEL, fg=TEXT, insertbackground=GREEN)
+            entry = tk.Entry(self, width=64, bg=PANEL, fg=TEXT, insertbackground=GREEN)
             entry.grid(row=i, column=1, padx=8, pady=6)
             self.fields[key] = entry
             if key in ("bat", "cwd", "logs"):
                 tk.Button(self, text="...", command=lambda k=key: self.pick(k), bg=PANEL, fg=CYAN, width=4).grid(row=i, column=2, padx=8)
-        self.fields["ports"].insert(0, "7000,7001")
+        if app:
+            self.fields["name"].insert(0, app["name"])
+            self.fields["bat"].insert(0, app["bat"])
+            self.fields["cwd"].insert(0, app["cwd"])
+            self.fields["ports"].insert(0, ",".join(str(p) for p in app.get("ports", [])))
+            self.fields["logs"].insert(0, app.get("logs", ""))
+        else:
+            self.fields["ports"].insert(0, "7000")
         buttons = tk.Frame(self, bg=BG)
         buttons.grid(row=len(rows), column=0, columnspan=3, sticky="e", padx=12, pady=12)
         tk.Button(buttons, text="Cancelar", command=self.destroy, bg=PANEL, fg=TEXT, width=12).pack(side="right", padx=4)
@@ -279,9 +365,8 @@ class ServiceDialog(tk.Toplevel):
         if not name or not bat:
             messagebox.showerror("Faltan datos", "Nombre y BAT son obligatorios.")
             return
-        key = slug(name).lower()
         app = {
-            "key": key,
+            "key": slug(name).lower(),
             "name": name,
             "task": f"Deployer_{slug(name)}",
             "cwd": cwd,
@@ -289,7 +374,7 @@ class ServiceDialog(tk.Toplevel):
             "ports": ports,
             "logs": logs,
         }
-        self.app_ui.save_new_service(app)
+        self.app_ui.save_service(app, self.old_key)
         self.destroy()
 
 
@@ -298,29 +383,57 @@ class ServiceCard(tk.Frame):
         super().__init__(parent, bg=PANEL, bd=1, relief="solid")
         self.app_ui = app_ui
         self.app = app
-        self.title = tk.Label(self, text=app["name"], fg=GREEN, bg=PANEL, font=("Consolas", 15, "bold"))
-        self.title.pack(anchor="w", padx=12, pady=(10, 4))
-        self.status = tk.Label(self, fg=TEXT, bg=PANEL, font=("Consolas", 10), justify="left")
+        self.bar = tk.Frame(self, bg=RED, width=7)
+        self.bar.pack(side="left", fill="y")
+        body = tk.Frame(self, bg=PANEL)
+        body.pack(side="left", fill="both", expand=True)
+        header = tk.Frame(body, bg=PANEL)
+        header.pack(fill="x", padx=12, pady=(10, 4))
+        self.title = tk.Label(header, text=app["name"], fg=GREEN, bg=PANEL, font=("Consolas", 15, "bold"))
+        self.title.pack(side="left")
+        tk.Button(header, text="Editar", command=lambda: app_ui.edit_service(app), bg=PANEL_2, fg=CYAN, width=8).pack(side="right", padx=2)
+        tk.Button(header, text="Quitar", command=lambda: app_ui.delete_service(app), bg=PANEL_2, fg=RED, width=8).pack(side="right", padx=2)
+        self.status = tk.Label(body, fg=TEXT, bg=PANEL, font=("Consolas", 10), justify="left")
         self.status.pack(anchor="w", padx=12)
-        buttons = tk.Frame(self, bg=PANEL)
+        self.ports = tk.Frame(body, bg=PANEL)
+        self.ports.pack(anchor="w", padx=12, pady=4)
+        buttons = tk.Frame(body, bg=PANEL)
         buttons.pack(anchor="w", padx=10, pady=10)
-        for label, cmd in [("Iniciar", self.start), ("Detener", self.stop), ("Reiniciar", self.restart), ("Abrir CMD", self.open_cmd), ("Logs", self.open_logs)]:
-            tk.Button(buttons, text=label, command=cmd, bg=BG, fg=CYAN, width=11).pack(side="left", padx=3)
+        for label, cmd in [
+            ("Instalar", self.install), ("Iniciar", self.start), ("Detener", self.stop),
+            ("Reiniciar", self.restart), ("Abrir CMD", self.open_cmd), ("Ver logs", self.open_logs),
+        ]:
+            tk.Button(buttons, text=label, command=cmd, bg=BG, fg=CYAN, width=10).pack(side="left", padx=3)
 
     def refresh(self):
         state = task_state(self.app["task"])
+        statuses = port_statuses(self.app.get("ports", []))
         pids = port_pids(self.app.get("ports", []))
-        color = GREEN if pids or "RUNNING" in state else YELLOW if "READY" in state else RED
+        active = bool(pids) or "RUNNING" in state
+        missing = not Path(self.app["bat"]).exists()
+        color = RED if missing else GREEN if active else YELLOW if "READY" in state else RED
+        self.bar.configure(bg=color)
         self.title.configure(fg=color)
-        self.status.configure(text=f"Tarea: {state}\nPuertos: {ports_text(self.app.get('ports', []))}\n{process_metrics(pids)}")
+        self.status.configure(text=f"Tarea: {state}  |  {process_metrics(pids)}\nBAT: {'OK' if not missing else 'FALTA'}")
+        for child in self.ports.winfo_children():
+            child.destroy()
+        for port, ok in statuses:
+            tk.Label(self.ports, text=f" {port} {'OK' if ok else '--'} ", fg=BG, bg=GREEN if ok else RED, font=("Consolas", 9, "bold")).pack(side="left", padx=3)
+        return {"active": active, "missing": missing, "ports_ok": sum(1 for _, ok in statuses if ok), "ports_total": len(statuses)}
+
+    def install(self):
+        self.app_ui.install_one(self.app)
 
     def start(self):
         self.app_ui.bg(lambda: self._run(["schtasks", "/Run", "/TN", self.app["task"]], "iniciado"))
 
     def stop(self):
-        self.app_ui.bg(lambda: self._run(["schtasks", "/End", "/TN", self.app["task"]], "detenido"))
+        if messagebox.askyesno("Detener", f"Detener {self.app['name']}?"):
+            self.app_ui.bg(lambda: self._run(["schtasks", "/End", "/TN", self.app["task"]], "detenido"))
 
     def restart(self):
+        if not messagebox.askyesno("Reiniciar", f"Reiniciar {self.app['name']}?"):
+            return
         def work():
             self._run(["schtasks", "/End", "/TN", self.app["task"]], "detenido")
             self._run(["schtasks", "/Run", "/TN", self.app["task"]], "iniciado")
@@ -328,19 +441,14 @@ class ServiceCard(tk.Frame):
         self.app_ui.bg(work)
 
     def open_cmd(self):
-        bat = self.app["bat"]
-        if not Path(bat).exists():
-            messagebox.showerror("No existe", bat)
+        if not Path(self.app["bat"]).exists():
+            messagebox.showerror("No existe", self.app["bat"])
             return
-        subprocess.Popen(["cmd", "/k", f'cd /d "{self.app["cwd"]}" && call "{bat}"'], creationflags=subprocess.CREATE_NEW_CONSOLE)
+        subprocess.Popen(["cmd", "/k", f'cd /d "{self.app["cwd"]}" && call "{self.app["bat"]}"'], creationflags=subprocess.CREATE_NEW_CONSOLE)
         self.app_ui.log(f"[CMD] {self.app['name']} abierto en consola.")
 
     def open_logs(self):
-        log = latest_log(self.app.get("logs", "")) or latest_log(LOG_DIR)
-        if not log:
-            messagebox.showinfo("Logs", "No encontre logs para este sistema.")
-            return
-        subprocess.Popen(["notepad.exe", str(log)])
+        self.app_ui.show_logs(self.app)
 
     def _run(self, args, action):
         r = run(args)
