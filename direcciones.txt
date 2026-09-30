@@ -1,0 +1,4 @@
+SiAuditaxes_Multisite = D:\Auditaxes_Multisite\SiAudTax_Multisite = iniciar.bat
+SiAuditaxes_Auditoria = D:\SiAudTax Espejo\SiAudTax\scripts = LevantarSERVER-SiAudTax-Exposicion.bat
+LLM_Foda = D:\FODAFront\LLM_Foda_Frontend = start_frontend.bat
+TPSM = D:\TSPM = LevantarPROD-TPSM.bat
