@@ -5,8 +5,8 @@
       "key": "auditaxes",
       "name": "AUDITAXES",
       "task": "Deployer_AUDITAXES",
-      "cwd": "D:\\Auditaxes_Multisite\\SiAudTax_Multisite",
-      "bat": "D:\\Auditaxes_Multisite\\SiAudTax_Multisite\\iniciar.bat",
+      "cwd": "F:\\Documentos\\Deployer\\Deployer\\managed_bats",
+      "bat": "F:\\Documentos\\Deployer\\Deployer\\managed_bats\\AUDITAXES.bat",
       "ports": [4321, 4322, 4323],
       "logs": "D:\\Auditaxes_Multisite\\SiAudTax_Multisite\\logs"
     },
@@ -14,8 +14,8 @@
       "key": "siaudtax_exposicion",
       "name": "SiAudTax Exposicion",
       "task": "Deployer_SiAudTax_Exposicion",
-      "cwd": "D:\\SiAudTax Espejo\\SiAudTax\\scripts",
-      "bat": "D:\\SiAudTax Espejo\\SiAudTax\\scripts\\LevantarSERVER-SiAudTax-Exposicion.bat",
+      "cwd": "F:\\Documentos\\Deployer\\Deployer\\managed_bats",
+      "bat": "F:\\Documentos\\Deployer\\Deployer\\managed_bats\\SiAudTax-Exposicion.bat",
       "ports": [7009, 7010],
       "logs": "D:\\SiAudTax Espejo\\SiAudTax\\logs"
     },
@@ -23,8 +23,8 @@
       "key": "foda",
       "name": "LLM FODA",
       "task": "Deployer_FODA",
-      "cwd": "D:\\FODAFront\\LLM_Foda_Frontend",
-      "bat": "D:\\FODAFront\\LLM_Foda_Frontend\\start_frontend.bat",
+      "cwd": "F:\\Documentos\\Deployer\\Deployer\\managed_bats",
+      "bat": "F:\\Documentos\\Deployer\\Deployer\\managed_bats\\FODA.bat",
       "ports": [7004],
       "logs": "D:\\FODAFront\\LLM_Foda_Frontend\\logs"
     },
@@ -32,8 +32,8 @@
       "key": "tpsm",
       "name": "TPSM",
       "task": "Deployer_TPSM",
-      "cwd": "D:\\TSPM",
-      "bat": "D:\\TSPM\\LevantarPROD-TPSM.bat",
+      "cwd": "F:\\Documentos\\Deployer\\Deployer\\managed_bats",
+      "bat": "F:\\Documentos\\Deployer\\Deployer\\managed_bats\\TPSM.bat",
       "ports": [7003, 8015, 8105, 85],
       "logs": "C:\\TSPM\\Sistema"
     }
