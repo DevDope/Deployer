@@ -125,6 +125,8 @@ def process_metrics(pids):
 
 def latest_log(path):
     p = app_path(path)
+    if p.drive and not Path(p.drive + "\\").exists():
+        return None
     if p.is_file():
         return p
     if not p.exists():
@@ -133,10 +135,16 @@ def latest_log(path):
     return max(files, key=lambda x: x.stat().st_mtime) if files else None
 
 
-def read_tail(path, lines=120):
-    log = latest_log(path)
+def read_tail(paths, lines=120):
+    if isinstance(paths, (str, Path)):
+        paths = [paths]
+    log = None
+    for path in paths:
+        log = latest_log(path)
+        if log:
+            break
     if not log:
-        return None, "No encontre logs para este sistema."
+        return None, "No encontre logs para este sistema ni en panel_logs."
     try:
         text = log.read_text(encoding="utf-8", errors="replace").splitlines()[-lines:]
         return log, "\n".join(text)
@@ -349,7 +357,7 @@ class App(tk.Tk):
         self.log_view.see("end")
 
     def show_logs(self, app):
-        self.selected_log = app.get("logs", "")
+        self.selected_log = [app.get("logs", ""), LOG_DIR / f"{app['task']}.log"]
         self.refresh_log()
 
     def install_all(self):
@@ -452,7 +460,7 @@ class ServiceDialog(tk.Toplevel):
             self.fields["ports"].insert(0, "7000")
         help_text = (
             "BAT: archivo .bat que se ejecuta. Carpeta: carpeta donde debe correr. "
-            "Logs: carpeta o archivo .log. Puertos: separados por coma."
+            "Logs: carpeta o archivo .log opcional; si no existe se usa panel_logs. Puertos: separados por coma."
         )
         tk.Label(self, text=help_text, fg=MUTED, bg=BG, font=("Consolas", 9), wraplength=560, justify="left").grid(
             row=len(rows), column=0, columnspan=3, sticky="w", padx=12, pady=(4, 0)
