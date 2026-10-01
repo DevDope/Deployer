@@ -12,6 +12,7 @@ CONFIG = ROOT / "services.json"
 LOG_DIR = ROOT / "panel_logs"
 MANAGED_BATS = ROOT / "managed_bats"
 ADDRESSES = ROOT / "direcciones.txt"
+VERSION = "v2.4 auto-install"
 LOG_DIR.mkdir(exist_ok=True)
 MANAGED_BATS.mkdir(exist_ok=True)
 
@@ -221,7 +222,7 @@ class App(tk.Tk):
         Logo(top).pack(side="left", padx=(0, 12))
         title_box = tk.Frame(top, bg=BG)
         title_box.pack(side="left")
-        tk.Label(title_box, text="DEPLOYER // OPS CONTROL", fg=GREEN, bg=BG, font=("Consolas", 24, "bold")).pack(anchor="w")
+        tk.Label(title_box, text=f"DEPLOYER // OPS CONTROL  {VERSION}", fg=GREEN, bg=BG, font=("Consolas", 24, "bold")).pack(anchor="w")
         self.summary = tk.Label(title_box, text="escaneando sistemas...", fg=MUTED, bg=BG, font=("Consolas", 10))
         self.summary.pack(anchor="w")
 
@@ -363,13 +364,18 @@ class App(tk.Tk):
     def repair_paths(self):
         if not messagebox.askyesno("Reparar rutas", "Restaurar servicios desde direcciones.txt?"):
             return
-        try:
-            self.config_data = restore_base_config()
-            self.render_cards()
-            self.refresh()
-            self.log("[OK] Rutas reparadas. Ahora presiona Instalar todo.")
-        except Exception as exc:
-            messagebox.showerror("No se pudo reparar", str(exc))
+        self.bg(self._repair_paths)
+
+    def _repair_paths(self):
+        config = restore_base_config()
+        for app in config["apps"]:
+            if not app_path(app["bat"]).exists():
+                return f"[ERROR] No existe wrapper: {app['bat']}"
+            create_task(app)
+        self.config_data = config
+        self.after(0, self.render_cards)
+        self.after(0, self.refresh)
+        return "[OK] Rutas reparadas y tareas reinstaladas. Ya puedes presionar Iniciar."
 
     def install_one(self, app):
         self.bg(lambda: self._install_one(app))
@@ -550,7 +556,7 @@ class ServiceCard(tk.Frame):
         self.app_ui.install_one(self.app)
 
     def start(self):
-        self.app_ui.bg(lambda: self._run(["schtasks", "/Run", "/TN", self.app["task"]], "iniciado"))
+        self.app_ui.bg(self._start)
 
     def stop(self):
         if messagebox.askyesno("Detener", f"Detener {self.app['name']}?"):
@@ -560,6 +566,8 @@ class ServiceCard(tk.Frame):
         if not messagebox.askyesno("Reiniciar", f"Reiniciar {self.app['name']}?"):
             return
         def work():
+            if not task_exists(self.app["task"]):
+                create_task(self.app)
             self._run(["schtasks", "/End", "/TN", self.app["task"]], "detenido")
             self._run(["schtasks", "/Run", "/TN", self.app["task"]], "iniciado")
             return f"[OK] {self.app['name']} reiniciado."
@@ -580,6 +588,11 @@ class ServiceCard(tk.Frame):
         r = run(args)
         msg = r.stdout.strip() or r.stderr.strip()
         return f"[{'OK' if r.returncode == 0 else 'ERROR'}] {self.app['name']} {action}. {msg}"
+
+    def _start(self):
+        if not task_exists(self.app["task"]):
+            create_task(self.app)
+        return self._run(["schtasks", "/Run", "/TN", self.app["task"]], "iniciado")
 
 
 class CloudCard(tk.Frame):
