@@ -12,7 +12,7 @@ CONFIG = ROOT / "services.json"
 LOG_DIR = ROOT / "panel_logs"
 MANAGED_BATS = ROOT / "managed_bats"
 ADDRESSES = ROOT / "direcciones.txt"
-VERSION = "v2.5 elevated-tasks"
+VERSION = "v2.6 diagnostico"
 LOG_DIR.mkdir(exist_ok=True)
 MANAGED_BATS.mkdir(exist_ok=True)
 
@@ -65,46 +65,70 @@ def task_exists(name):
 
 
 def task_state(name):
-    if not task_exists(name):
-        return "NO INSTALADO"
     try:
-        out = run(["schtasks", "/Query", "/TN", name, "/FO", "LIST"], timeout=4).stdout
+        task = name.replace("'", "''")
+        result = ps(f"$t=Get-ScheduledTask -TaskName '{task}' -ErrorAction Stop; $t.State.ToString()", timeout=15)
     except subprocess.TimeoutExpired:
         return "LENTO"
-    for line in out.splitlines():
-        if line.lower().startswith("status:"):
-            return line.split(":", 1)[1].strip().upper()
-    return "INSTALADO"
+    return result.stdout.strip().upper() if result.returncode == 0 else "ERROR CONSULTA"
 
 
-def port_pids(ports):
-    if not ports:
-        return []
-    script = (
-        "$ports=@(" + ",".join(str(p) for p in ports) + ");"
-        "$ids=@();"
-        "foreach($port in $ports){"
-        "$ids += Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue | "
-        "Select-Object -ExpandProperty OwningProcess -Unique"
-        "};"
-        "$ids | Where-Object {$_ -gt 0} | Sort-Object -Unique"
-    )
-    try:
-        out = ps(script, timeout=4).stdout
-    except subprocess.TimeoutExpired:
-        return []
-    return [x.strip() for x in out.splitlines() if x.strip().isdigit()]
+def tcp_listeners():
+    result = run(["netstat", "-ano", "-p", "tcp"], timeout=15)
+    if result.returncode:
+        raise RuntimeError(result.stderr or "No se pudieron consultar los puertos")
+    listeners = {}
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) == 5 and fields[0] == "TCP" and fields[2].rsplit(":", 1)[-1] == "0":
+            port = int(fields[1].rsplit(":", 1)[-1])
+            listeners.setdefault(port, set()).add(fields[-1])
+    return listeners
 
 
-def port_statuses(ports):
-    result = []
-    for port in ports:
-        try:
-            ok = ps(f"if(Get-NetTCPConnection -State Listen -LocalPort {port} -ErrorAction SilentlyContinue){{'OK'}}", timeout=3).stdout.strip()
-        except subprocess.TimeoutExpired:
-            ok = ""
-        result.append((port, bool(ok)))
-    return result
+def port_pids(ports, listeners=None):
+    listeners = tcp_listeners() if listeners is None else listeners
+    return sorted({pid for port in ports for pid in listeners.get(port, ())})
+
+
+def port_statuses(ports, listeners=None):
+    listeners = tcp_listeners() if listeners is None else listeners
+    return [(port, port in listeners) for port in ports]
+
+
+def diagnostic_report(config):
+    sections = [f"Deployer {VERSION}"]
+    for command in (["whoami"], ["netstat", "-ano", "-p", "tcp"]):
+        result = run(command, timeout=20)
+        sections.append(" ".join(command) + "\n" + result.stdout + result.stderr)
+    for app in config["apps"]:
+        sections.append(f"\n=== {app['name']} ===\nBAT: {app_path(app['bat'])}\nCarpeta: {app_path(app['cwd'])}")
+        bat = app_path(app["bat"])
+        if bat.is_file():
+            sections.append(bat.read_text(encoding="utf-8", errors="replace"))
+        task = app["task"].replace("'", "''")
+        script = (
+            "$ErrorActionPreference='Stop';"
+            f"$t=Get-ScheduledTask -TaskName '{task}';"
+            "$t | Select-Object TaskName,State | Format-List | Out-String;"
+            "$t.Principal | Select-Object UserId,LogonType,RunLevel | Format-List | Out-String;"
+            "$t.Actions | Format-List | Out-String;"
+            "$t | Get-ScheduledTaskInfo | Format-List | Out-String"
+        )
+        result = ps(script, timeout=20)
+        sections.append(result.stdout + result.stderr)
+        log, tail = read_tail(LOG_DIR / f"{app['task']}.log")
+        sections.append(f"Log: {log}\n{tail}")
+    if ADDRESSES.is_file():
+        sections.append("\n=== Rutas originales ===")
+        for line in ADDRESSES.read_text(encoding="utf-8", errors="replace").splitlines():
+            parts = [part.strip() for part in line.split("=")]
+            if len(parts) == 3:
+                target = Path(parts[1]) / parts[2]
+                sections.append(f"{target}: {'EXISTE' if target.is_file() else 'NO EXISTE'}")
+    report = ROOT / "diagnostico.txt"
+    report.write_text("\n".join(sections), encoding="utf-8")
+    return f"[OK] Diagnostico guardado en {report}"
 
 
 def process_metrics(pids):
@@ -245,12 +269,13 @@ class App(tk.Tk):
         Logo(top).pack(side="left", padx=(0, 12))
         title_box = tk.Frame(top, bg=BG)
         title_box.pack(side="left")
-        tk.Label(title_box, text=f"DEPLOYER // OPS CONTROL  {VERSION}", fg=GREEN, bg=BG, font=("Consolas", 24, "bold")).pack(anchor="w")
+        tk.Label(title_box, text=f"DEPLOYER // OPS CONTROL  {VERSION}", fg=GREEN, bg=BG, font=("Consolas", 16, "bold")).pack(anchor="w")
         self.summary = tk.Label(title_box, text="escaneando sistemas...", fg=MUTED, bg=BG, font=("Consolas", 10))
         self.summary.pack(anchor="w")
 
         tk.Checkbutton(top, text="Auto", variable=self.auto_refresh, bg=BG, fg=TEXT, selectcolor=PANEL, activebackground=BG).pack(side="right", padx=6)
         tk.Button(top, text="Instalar todo", command=self.install_all, bg=PANEL, fg=CYAN).pack(side="right", padx=6)
+        tk.Button(top, text="Diagnostico", command=lambda: self.bg(diagnostic_report, self.config_data), bg=PANEL, fg=YELLOW).pack(side="right", padx=6)
         tk.Button(top, text="Reparar rutas", command=self.repair_paths, bg=PANEL, fg=YELLOW).pack(side="right", padx=6)
         tk.Button(top, text="Agregar servicio", command=self.add_service, bg=PANEL, fg=CYAN).pack(side="right", padx=6)
         tk.Button(top, text="Refrescar", command=self.refresh, bg=PANEL, fg=GREEN).pack(side="right", padx=6)
@@ -330,10 +355,11 @@ class App(tk.Tk):
     def scan(self):
         try:
             data = {}
+            listeners = tcp_listeners()
             for app in self.config_data["apps"]:
                 state = task_state(app["task"])
-                statuses = port_statuses(app.get("ports", []))
-                pids = port_pids(app.get("ports", []))
+                statuses = port_statuses(app.get("ports", []), listeners)
+                pids = port_pids(app.get("ports", []), listeners)
                 data[app["key"]] = {
                     "state": state,
                     "statuses": statuses,
@@ -565,10 +591,10 @@ class ServiceCard(tk.Frame):
         pids = snap.get("pids", [])
         active = bool(pids) or "RUNNING" in state
         missing = snap.get("missing", False)
-        color = RED if missing else GREEN if active else YELLOW if "READY" in state else RED
+        color = YELLOW if not snap else RED if missing else GREEN if active else YELLOW if "READY" in state else RED
         self.bar.configure(bg=color)
         self.title.configure(fg=color)
-        self.status.configure(text=f"Tarea: {state}  |  {snap.get('metrics', 'CPU -- | RAM --')}\nBAT: {'OK' if not missing else 'FALTA'}")
+        self.status.configure(text=f"Tarea: {state}  |  {snap.get('metrics', 'CPU -- | RAM --')}\nLanzador: {'OK' if not missing else 'FALTA'}")
         for child in self.ports.winfo_children():
             child.destroy()
         for port, ok in statuses:

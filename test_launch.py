@@ -1,4 +1,5 @@
 import tempfile
+import socket
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,6 +9,24 @@ import deployer_panel as panel
 
 
 class LaunchCheck(unittest.TestCase):
+    def test_live_listener_is_detected(self):
+        with socket.socket() as server:
+            server.bind(("127.0.0.1", 0))
+            server.listen()
+            port = server.getsockname()[1]
+            listeners = panel.tcp_listeners()
+            self.assertEqual(panel.port_statuses([port], listeners), [(port, True)])
+            self.assertTrue(panel.port_pids([port], listeners))
+
+    def test_listener_parsing_does_not_depend_on_windows_language(self):
+        output = (
+            "  TCP  127.0.0.1:7004  0.0.0.0:0  ESCUCHANDO  123\n"
+            "  TCP  [::]:7010  [::]:0  LISTENING  456\n"
+            "  TCP  127.0.0.1:9000  127.0.0.1:7004  ESTABLISHED  789\n"
+        )
+        with patch.object(panel, "run", return_value=SimpleNamespace(returncode=0, stdout=output)):
+            self.assertEqual(panel.tcp_listeners(), {7004: {"123"}, 7010: {"456"}})
+
     def test_task_requests_elevated_interactive_user_and_quotes_paths(self):
         app = {
             "task": "Deployer_Check",
