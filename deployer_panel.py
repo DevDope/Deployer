@@ -12,7 +12,7 @@ CONFIG = ROOT / "services.json"
 LOG_DIR = ROOT / "panel_logs"
 MANAGED_BATS = ROOT / "managed_bats"
 ADDRESSES = ROOT / "direcciones.txt"
-VERSION = "v2.4 auto-install"
+VERSION = "v2.5 elevated-tasks"
 LOG_DIR.mkdir(exist_ok=True)
 MANAGED_BATS.mkdir(exist_ok=True)
 
@@ -156,11 +156,19 @@ def create_task(app):
     task = app["task"]
     log = LOG_DIR / f"{task}.log"
     command = f'cd /d "{app_path(app["cwd"])}" && call "{app_path(app["bat"])}" >> "{log}" 2>&1'
+    quote = lambda value: "'" + str(value).replace("'", "''") + "'"
     script = (
-        f"$action=New-ScheduledTaskAction -Execute 'cmd.exe' -Argument '/d /c {command}';"
+        "$ErrorActionPreference='Stop';"
+        "$identity=[Security.Principal.WindowsIdentity]::GetCurrent();"
+        "$user=New-Object Security.Principal.WindowsPrincipal($identity);"
+        "if(-not $user.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))"
+        "{throw 'Abre el panel como administrador para instalar las tareas.'};"
+        "$principal=New-ScheduledTaskPrincipal -UserId $identity.Name -LogonType Interactive -RunLevel Highest;"
+        f"$action=New-ScheduledTaskAction -Execute 'cmd.exe' -Argument {quote('/d /c ' + command)} "
+        f"-WorkingDirectory {quote(app_path(app['cwd']))};"
         "$settings=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries "
         "-ExecutionTimeLimit (New-TimeSpan -Hours 0);"
-        f"Register-ScheduledTask -TaskName '{task}' -Action $action -Settings $settings -Force | Out-Null"
+        f"Register-ScheduledTask -TaskName {quote(task)} -Action $action -Principal $principal -Settings $settings -Force | Out-Null"
     )
     r = ps(script)
     if r.returncode:
@@ -169,7 +177,14 @@ def create_task(app):
 
 def write_wrapper(name, target):
     wrapper = MANAGED_BATS / name
-    wrapper.write_text(f'@echo off\ncall "{target}"\nexit /b %ERRORLEVEL%\n', encoding="utf-8")
+    wrapper.write_text(
+        f'@echo off\nsetlocal DisableDelayedExpansion\n'
+        f'if not exist "{target}" (\n'
+        f'  echo [ERROR] No existe el BAT original: "{target}"\n'
+        '  exit /b 2\n)\n'
+        f'echo [%date% %time%] Ejecutando "{target}"\n'
+        f'call "{target}"\nexit /b %ERRORLEVEL%\n', encoding="utf-8"
+    )
     return str(wrapper.relative_to(ROOT))
 
 
@@ -357,7 +372,7 @@ class App(tk.Tk):
         self.log_view.see("end")
 
     def show_logs(self, app):
-        self.selected_log = [app.get("logs", ""), LOG_DIR / f"{app['task']}.log"]
+        self.selected_log = [LOG_DIR / f"{app['task']}.log", app.get("logs", "")]
         self.refresh_log()
 
     def install_all(self):
