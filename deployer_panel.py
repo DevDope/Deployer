@@ -10,7 +10,10 @@ from tkinter import filedialog, messagebox
 ROOT = Path(__file__).resolve().parent
 CONFIG = ROOT / "services.json"
 LOG_DIR = ROOT / "panel_logs"
+MANAGED_BATS = ROOT / "managed_bats"
+ADDRESSES = ROOT / "direcciones.txt"
 LOG_DIR.mkdir(exist_ok=True)
+MANAGED_BATS.mkdir(exist_ok=True)
 
 BG = "#050807"
 PANEL = "#0c1512"
@@ -155,6 +158,46 @@ def create_task(app):
         raise RuntimeError(r.stderr or r.stdout or f"No se pudo instalar {task}")
 
 
+def write_wrapper(name, target):
+    wrapper = MANAGED_BATS / name
+    wrapper.write_text(f'@echo off\ncall "{target}"\nexit /b %ERRORLEVEL%\n', encoding="utf-8")
+    return str(wrapper.relative_to(ROOT))
+
+
+def restore_base_config():
+    if not ADDRESSES.exists():
+        raise FileNotFoundError(f"No existe {ADDRESSES}")
+    apps = []
+    specs = {
+        "SiAuditaxes_Multisite": ("auditaxes", "AUDITAXES", "Deployer_AUDITAXES", "AUDITAXES.bat", [4321, 4322, 4323], "logs"),
+        "SiAuditaxes_Auditoria": ("siaudtax_exposicion", "SiAudTax Exposicion", "Deployer_SiAudTax_Exposicion", "SiAudTax-Exposicion.bat", [7009, 7010], "..\\logs"),
+        "LLM_Foda": ("foda", "LLM FODA", "Deployer_FODA", "FODA.bat", [7004], "logs"),
+        "TPSM": ("tpsm", "TPSM", "Deployer_TPSM", "TPSM.bat", [7003, 8015, 8105, 85], "C:\\TSPM\\Sistema"),
+    }
+    for raw in ADDRESSES.read_text(encoding="utf-8", errors="replace").splitlines():
+        parts = [x.strip() for x in raw.split("=")]
+        if len(parts) != 3 or parts[0] not in specs:
+            continue
+        key, label, task, wrapper_name, ports, logs = specs[parts[0]]
+        folder = Path(parts[1])
+        target = folder / parts[2]
+        write_wrapper(wrapper_name, target)
+        apps.append({
+            "key": key,
+            "name": label,
+            "task": task,
+            "cwd": "managed_bats",
+            "bat": f"managed_bats\\{wrapper_name}",
+            "ports": ports,
+            "logs": str((folder / logs).resolve()) if ":" not in logs else logs,
+        })
+    if not apps:
+        raise RuntimeError("direcciones.txt no tiene servicios validos.")
+    config = {"cloudflared_service": "cloudflared", "apps": apps}
+    save_config(config)
+    return config
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -184,6 +227,7 @@ class App(tk.Tk):
 
         tk.Checkbutton(top, text="Auto", variable=self.auto_refresh, bg=BG, fg=TEXT, selectcolor=PANEL, activebackground=BG).pack(side="right", padx=6)
         tk.Button(top, text="Instalar todo", command=self.install_all, bg=PANEL, fg=CYAN).pack(side="right", padx=6)
+        tk.Button(top, text="Reparar rutas", command=self.repair_paths, bg=PANEL, fg=YELLOW).pack(side="right", padx=6)
         tk.Button(top, text="Agregar servicio", command=self.add_service, bg=PANEL, fg=CYAN).pack(side="right", padx=6)
         tk.Button(top, text="Refrescar", command=self.refresh, bg=PANEL, fg=GREEN).pack(side="right", padx=6)
 
@@ -316,6 +360,17 @@ class App(tk.Tk):
             return "[OK] Tareas programadas instaladas/actualizadas."
         self.bg(work)
 
+    def repair_paths(self):
+        if not messagebox.askyesno("Reparar rutas", "Restaurar servicios desde direcciones.txt?"):
+            return
+        try:
+            self.config_data = restore_base_config()
+            self.render_cards()
+            self.refresh()
+            self.log("[OK] Rutas reparadas. Ahora presiona Instalar todo.")
+        except Exception as exc:
+            messagebox.showerror("No se pudo reparar", str(exc))
+
     def install_one(self, app):
         self.bg(lambda: self._install_one(app))
 
@@ -389,8 +444,15 @@ class ServiceDialog(tk.Toplevel):
             self.fields["logs"].insert(0, app.get("logs", ""))
         else:
             self.fields["ports"].insert(0, "7000")
+        help_text = (
+            "BAT: archivo .bat que se ejecuta. Carpeta: carpeta donde debe correr. "
+            "Logs: carpeta o archivo .log. Puertos: separados por coma."
+        )
+        tk.Label(self, text=help_text, fg=MUTED, bg=BG, font=("Consolas", 9), wraplength=560, justify="left").grid(
+            row=len(rows), column=0, columnspan=3, sticky="w", padx=12, pady=(4, 0)
+        )
         buttons = tk.Frame(self, bg=BG)
-        buttons.grid(row=len(rows), column=0, columnspan=3, sticky="e", padx=12, pady=12)
+        buttons.grid(row=len(rows) + 1, column=0, columnspan=3, sticky="e", padx=12, pady=12)
         tk.Button(buttons, text="Cancelar", command=self.destroy, bg=PANEL, fg=TEXT, width=12).pack(side="right", padx=4)
         tk.Button(buttons, text="Guardar", command=self.save, bg=PANEL, fg=GREEN, width=12).pack(side="right", padx=4)
         self.grab_set()
@@ -421,6 +483,12 @@ class ServiceDialog(tk.Toplevel):
             return
         if not name or not bat:
             messagebox.showerror("Faltan datos", "Nombre y BAT son obligatorios.")
+            return
+        if not app_path(bat).exists():
+            messagebox.showerror("BAT no existe", str(app_path(bat)))
+            return
+        if not app_path(cwd).exists():
+            messagebox.showerror("Carpeta no existe", str(app_path(cwd)))
             return
         app = {
             "key": slug(name).lower(),

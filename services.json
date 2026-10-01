@@ -7,7 +7,11 @@
       "task": "Deployer_AUDITAXES",
       "cwd": "managed_bats",
       "bat": "managed_bats\\AUDITAXES.bat",
-      "ports": [4321, 4322, 4323],
+      "ports": [
+        4321,
+        4322,
+        4323
+      ],
       "logs": "D:\\Auditaxes_Multisite\\SiAudTax_Multisite\\logs"
     },
     {
@@ -16,7 +20,10 @@
       "task": "Deployer_SiAudTax_Exposicion",
       "cwd": "managed_bats",
       "bat": "managed_bats\\SiAudTax-Exposicion.bat",
-      "ports": [7009, 7010],
+      "ports": [
+        7009,
+        7010
+      ],
       "logs": "D:\\SiAudTax Espejo\\SiAudTax\\logs"
     },
     {
@@ -25,7 +32,9 @@
       "task": "Deployer_FODA",
       "cwd": "managed_bats",
       "bat": "managed_bats\\FODA.bat",
-      "ports": [7004],
+      "ports": [
+        7004
+      ],
       "logs": "D:\\FODAFront\\LLM_Foda_Frontend\\logs"
     },
     {
@@ -34,7 +43,12 @@
       "task": "Deployer_TPSM",
       "cwd": "managed_bats",
       "bat": "managed_bats\\TPSM.bat",
-      "ports": [7003, 8015, 8105, 85],
+      "ports": [
+        7003,
+        8015,
+        8105,
+        85
+      ],
       "logs": "C:\\TSPM\\Sistema"
     }
   ]
