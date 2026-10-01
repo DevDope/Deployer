@@ -23,11 +23,11 @@ TEXT = "#d8ffe8"
 MUTED = "#80a895"
 
 
-def run(args, timeout=25):
+def run(args, timeout=8):
     return subprocess.run(args, text=True, capture_output=True, timeout=timeout, shell=False)
 
 
-def ps(script, timeout=25):
+def ps(script, timeout=8):
     return run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script], timeout)
 
 
@@ -48,14 +48,25 @@ def slug(text):
     return "_".join(part for part in value.split("_") if part) or "SERVICIO"
 
 
+def app_path(value):
+    p = Path(value)
+    return p if p.is_absolute() else ROOT / p
+
+
 def task_exists(name):
-    return run(["schtasks", "/Query", "/TN", name]).returncode == 0
+    try:
+        return run(["schtasks", "/Query", "/TN", name], timeout=4).returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
 
 
 def task_state(name):
     if not task_exists(name):
         return "NO INSTALADO"
-    out = run(["schtasks", "/Query", "/TN", name, "/FO", "LIST"]).stdout
+    try:
+        out = run(["schtasks", "/Query", "/TN", name, "/FO", "LIST"], timeout=4).stdout
+    except subprocess.TimeoutExpired:
+        return "LENTO"
     for line in out.splitlines():
         if line.lower().startswith("status:"):
             return line.split(":", 1)[1].strip().upper()
@@ -74,13 +85,20 @@ def port_pids(ports):
         "};"
         "$ids | Where-Object {$_ -gt 0} | Sort-Object -Unique"
     )
-    return [x.strip() for x in ps(script).stdout.splitlines() if x.strip().isdigit()]
+    try:
+        out = ps(script, timeout=4).stdout
+    except subprocess.TimeoutExpired:
+        return []
+    return [x.strip() for x in out.splitlines() if x.strip().isdigit()]
 
 
 def port_statuses(ports):
     result = []
     for port in ports:
-        ok = ps(f"if(Get-NetTCPConnection -State Listen -LocalPort {port} -ErrorAction SilentlyContinue){{'OK'}}").stdout.strip()
+        try:
+            ok = ps(f"if(Get-NetTCPConnection -State Listen -LocalPort {port} -ErrorAction SilentlyContinue){{'OK'}}", timeout=3).stdout.strip()
+        except subprocess.TimeoutExpired:
+            ok = ""
         result.append((port, bool(ok)))
     return result
 
@@ -95,11 +113,14 @@ def process_metrics(pids):
         "$cpu=($ps | Measure-Object CPU -Sum).Sum;"
         "'CPU {0:n1}s | RAM {1:n0} MB' -f $cpu, ($ram/1MB)"
     )
-    return ps(script).stdout.strip() or "CPU -- | RAM --"
+    try:
+        return ps(script, timeout=4).stdout.strip() or "CPU -- | RAM --"
+    except subprocess.TimeoutExpired:
+        return "CPU -- | RAM --"
 
 
 def latest_log(path):
-    p = Path(path)
+    p = app_path(path)
     if p.is_file():
         return p
     if not p.exists():
@@ -122,7 +143,7 @@ def read_tail(path, lines=120):
 def create_task(app):
     task = app["task"]
     log = LOG_DIR / f"{task}.log"
-    command = f'cd /d "{app["cwd"]}" && call "{app["bat"]}" >> "{log}" 2>&1'
+    command = f'cd /d "{app_path(app["cwd"])}" && call "{app_path(app["bat"])}" >> "{log}" 2>&1'
     script = (
         f"$action=New-ScheduledTaskAction -Execute 'cmd.exe' -Argument '/d /c {command}';"
         "$settings=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries "
@@ -145,6 +166,7 @@ class App(tk.Tk):
         self.cards = {}
         self.selected_log = None
         self.auto_refresh = tk.BooleanVar(value=True)
+        self.scan_running = False
         self.build()
         self.refresh()
         self.after(500, self.drain)
@@ -216,6 +238,9 @@ class App(tk.Tk):
     def drain(self):
         while not self.q.empty():
             msg = self.q.get()
+            if isinstance(msg, tuple) and msg[0] == "scan":
+                self.apply_scan(msg[1])
+                continue
             if msg:
                 self.log(msg)
             self.refresh()
@@ -228,15 +253,47 @@ class App(tk.Tk):
         self.after(5000, self.auto_tick)
 
     def refresh(self):
+        if self.scan_running:
+            return
+        self.scan_running = True
+        self.summary.configure(text="escaneando sistemas...")
+        threading.Thread(target=self.scan, daemon=True).start()
+
+    def scan(self):
+        try:
+            data = {}
+            for app in self.config_data["apps"]:
+                state = task_state(app["task"])
+                statuses = port_statuses(app.get("ports", []))
+                pids = port_pids(app.get("ports", []))
+                data[app["key"]] = {
+                    "state": state,
+                    "statuses": statuses,
+                    "pids": pids,
+                    "metrics": process_metrics(pids),
+                    "missing": not app_path(app["bat"]).exists(),
+                }
+            service = self.config_data.get("cloudflared_service", "cloudflared")
+            try:
+                cloud = ps(f"Get-Service -Name '{service}' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Status", timeout=4).stdout.strip()
+            except subprocess.TimeoutExpired:
+                cloud = "LENTO"
+            self.q.put(("scan", {"apps": data, "cloud": cloud}))
+        except Exception as exc:
+            self.q.put(("scan", {"apps": {}, "cloud": "ERROR"}))
+            self.q.put(f"[ERROR] Escaneo fallo: {exc}")
+
+    def apply_scan(self, scan):
         active = ports_ok = total_ports = missing = 0
-        for card in self.cards.values():
-            state = card.refresh()
+        for key, card in self.cards.items():
+            state = card.apply_snapshot(scan["apps"].get(key, {}))
             active += int(state["active"])
             missing += int(state["missing"])
             ports_ok += state["ports_ok"]
             total_ports += state["ports_total"]
-        self.cloud.refresh()
+        self.cloud.apply_status(scan["cloud"])
         self.summary.configure(text=f"{active}/{len(self.cards)} activos  |  {ports_ok}/{total_ports} puertos OK  |  {missing} BAT faltantes")
+        self.scan_running = False
 
     def refresh_log(self):
         if not self.selected_log:
@@ -253,7 +310,7 @@ class App(tk.Tk):
     def install_all(self):
         def work():
             for app in self.config_data["apps"]:
-                if not Path(app["bat"]).exists():
+                if not app_path(app["bat"]).exists():
                     return f"[ERROR] No existe: {app['bat']}"
                 create_task(app)
             return "[OK] Tareas programadas instaladas/actualizadas."
@@ -263,7 +320,7 @@ class App(tk.Tk):
         self.bg(lambda: self._install_one(app))
 
     def _install_one(self, app):
-        if not Path(app["bat"]).exists():
+        if not app_path(app["bat"]).exists():
             return f"[ERROR] No existe: {app['bat']}"
         create_task(app)
         return f"[OK] Tarea instalada: {app['task']}"
@@ -405,16 +462,16 @@ class ServiceCard(tk.Frame):
         ]:
             tk.Button(buttons, text=label, command=cmd, bg=BG, fg=CYAN, width=10).pack(side="left", padx=3)
 
-    def refresh(self):
-        state = task_state(self.app["task"])
-        statuses = port_statuses(self.app.get("ports", []))
-        pids = port_pids(self.app.get("ports", []))
+    def apply_snapshot(self, snap):
+        state = snap.get("state", "ESCANEANDO")
+        statuses = snap.get("statuses", [])
+        pids = snap.get("pids", [])
         active = bool(pids) or "RUNNING" in state
-        missing = not Path(self.app["bat"]).exists()
+        missing = snap.get("missing", False)
         color = RED if missing else GREEN if active else YELLOW if "READY" in state else RED
         self.bar.configure(bg=color)
         self.title.configure(fg=color)
-        self.status.configure(text=f"Tarea: {state}  |  {process_metrics(pids)}\nBAT: {'OK' if not missing else 'FALTA'}")
+        self.status.configure(text=f"Tarea: {state}  |  {snap.get('metrics', 'CPU -- | RAM --')}\nBAT: {'OK' if not missing else 'FALTA'}")
         for child in self.ports.winfo_children():
             child.destroy()
         for port, ok in statuses:
@@ -441,10 +498,11 @@ class ServiceCard(tk.Frame):
         self.app_ui.bg(work)
 
     def open_cmd(self):
-        if not Path(self.app["bat"]).exists():
-            messagebox.showerror("No existe", self.app["bat"])
+        bat = app_path(self.app["bat"])
+        if not bat.exists():
+            messagebox.showerror("No existe", str(bat))
             return
-        subprocess.Popen(["cmd", "/k", f'cd /d "{self.app["cwd"]}" && call "{self.app["bat"]}"'], creationflags=subprocess.CREATE_NEW_CONSOLE)
+        subprocess.Popen(["cmd", "/k", f'cd /d "{app_path(self.app["cwd"])}" && call "{bat}"'], creationflags=subprocess.CREATE_NEW_CONSOLE)
         self.app_ui.log(f"[CMD] {self.app['name']} abierto en consola.")
 
     def open_logs(self):
@@ -469,9 +527,8 @@ class CloudCard(tk.Frame):
         for label, action in [("Iniciar", "Start-Service"), ("Detener", "Stop-Service"), ("Reiniciar", "Restart-Service")]:
             tk.Button(buttons, text=label, command=lambda a=action: self.control(a), bg=BG, fg=CYAN, width=11).pack(side="left", padx=3)
 
-    def refresh(self):
-        out = ps(f"Get-Service -Name '{self.service}' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Status").stdout.strip()
-        self.status.configure(text=f"Servicio: {self.service} | Estado: {out or 'NO ENCONTRADO'}")
+    def apply_status(self, status):
+        self.status.configure(text=f"Servicio: {self.service} | Estado: {status or 'NO ENCONTRADO'}")
 
     def control(self, action):
         self.app_ui.bg(lambda: self._control(action))
