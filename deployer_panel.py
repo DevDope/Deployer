@@ -1,4 +1,6 @@
 import json
+import base64
+import ctypes
 import hashlib
 import os
 import queue
@@ -21,7 +23,7 @@ CONFIG = ROOT / "services.json"
 LOG_DIR = ROOT / "panel_logs"
 MANAGED_BATS = ROOT / "managed_bats"
 ADDRESSES = ROOT / "direcciones.txt"
-VERSION = "v3.5"
+VERSION = "v3.6"
 LOG_DIR.mkdir(exist_ok=True)
 MANAGED_BATS.mkdir(exist_ok=True)
 
@@ -67,8 +69,65 @@ def app_path(value):
     return p if p.is_absolute() else ROOT / p
 
 
+def crypt_secret(data, decrypt=False):
+    from ctypes import wintypes
+    class Blob(ctypes.Structure):
+        _fields_ = [("size", wintypes.DWORD), ("data", ctypes.POINTER(ctypes.c_ubyte))]
+    buffer = ctypes.create_string_buffer(data)
+    source = Blob(len(data), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_ubyte)))
+    output = Blob()
+    crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    function = crypt32.CryptUnprotectData if decrypt else crypt32.CryptProtectData
+    function.argtypes = [ctypes.POINTER(Blob), ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(Blob)]
+    function.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    if not function(ctypes.byref(source), None, None, None, None, 1, ctypes.byref(output)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        return ctypes.string_at(output.data, output.size)
+    finally:
+        kernel32.LocalFree(output.data)
+
+
+def script_sources(path):
+    base = path.resolve().parent
+    pending = [path.resolve()]
+    sources = {}
+    while pending:
+        current = pending.pop()
+        if current in sources:
+            continue
+        if len(sources) >= 32:
+            raise OSError("Demasiados scripts enlazados; configura los puertos manualmente.")
+        data = current.read_bytes()
+        sources[current] = data
+        text = data.decode("utf-8-sig", errors="replace")
+        references = re.findall(r'(?i)-File[ \t]+"%~dp0([^"\r\n]+)"', text)
+        for command in re.findall(r'(?i)\b(?:pnpm|npm)(?:\.cmd)?[ \t]+(?:run[ \t]+)?([\w:-]+)', text):
+            manifest = base / "package.json"
+            if manifest.is_file():
+                manifest_data = manifest.read_bytes()
+                try:
+                    package = json.loads(manifest_data)
+                except ValueError as exc:
+                    raise OSError(f"package.json invalido: {manifest}") from exc
+                script = package.get("scripts", {}).get(command, "")
+                if script:
+                    sources[manifest] = manifest_data
+                    references.extend(re.findall(r'(?i)\bnode[ \t]+["\']?([^\s"\']+\.(?:mjs|cjs|js))', script))
+        for reference in references:
+            target = (base / reference.replace("\\", "/")).resolve()
+            if target.is_relative_to(base):
+                pending.append(target)
+    return sources
+
+
 def inspect_bat(path):
-    data = app_path(path).read_bytes()
+    path = app_path(path)
+    sources = script_sources(path)
+    data = sources[path.resolve()]
     text = data.decode("utf-8-sig", errors="replace")
     variables = {}
     commands = []
@@ -81,7 +140,7 @@ def inspect_bat(path):
         if assignment:
             variables[assignment[1].upper()] = assignment[2].rstrip('"').strip()
         commands.append(line)
-    # shortcut: static BAT inspection only; computed values and called scripts need manual ports.
+    # shortcut: only literal links and ports; computed script paths still need manual ports.
     ports = {int(value) for key, value in variables.items()
              if re.search(r"(?:^|_)PORT(?:$|_)", key) and value.isdigit() and 1 <= int(value) <= 65535}
     for command in commands:
@@ -91,6 +150,12 @@ def inspect_bat(path):
             number = int(next(part for part in value if part))
             if 1 <= number <= 65535:
                 ports.add(number)
+    for source, content in sources.items():
+        if source == path.resolve() or source.name == "package.json":
+            continue
+        linked = content.decode("utf-8-sig", errors="replace")
+        ports.update(int(value) for value in re.findall(r'--port(?:=|[ \t]+)(\d+)\b', linked) if 1 <= int(value) <= 65535)
+        ports.update(int(value) for value in re.findall(r'\burl\s*:\s*["\']http://(?:localhost|127\.0\.0\.1):(\d+)\b', linked) if 1 <= int(value) <= 65535)
     url = next((variables[key] for key in ("PUBLIC_URL", "SITE_URL", "APP_URL", "SITE_ORIGIN", "PUBLIC_ORIGIN")
                 if variables.get(key, "").startswith(("https://", "http://"))), "")
     active = "\n".join(line for line in text.splitlines() if not re.match(r"(?i)\s*(?:@?rem\b|::)", line))
@@ -100,7 +165,11 @@ def inspect_bat(path):
         and bool(re.fullmatch(r'(?i)\s*@?cd\s+/d\s+"?%~dp0"?\s*', directories[0]))
         and bool(re.search(r"(?i)\b(?:npm|pnpm)(?:\.cmd)?\s+(?:install|ci|build|run|exec)\b", active))
     )
-    return {"ports": sorted(ports), "url": url, "script_hash": hashlib.sha256(data).hexdigest(), "requires_manifest": requires_manifest}
+    digest = hashlib.sha256()
+    for source, content in sorted(sources.items()):
+        digest.update(str(source).encode("utf-8"))
+        digest.update(b"\0" + content + b"\0")
+    return {"ports": sorted(ports), "url": url, "script_hash": digest.hexdigest(), "requires_manifest": requires_manifest}
 
 
 def sync_bat(app):
@@ -283,12 +352,16 @@ def run_task(name):
     with (LOG_DIR / f"{name}.log").open("a", encoding="utf-8") as log:
         try:
             sync_bat(app)
+            environment = os.environ.copy()
+            if app.get("inference_key_protected"):
+                environment["INFERENCE_API_KEY"] = crypt_secret(base64.b64decode(app["inference_key_protected"]), decrypt=True).decode("utf-8")
             log.write(f"\n[{datetime.now():%Y-%m-%d %H:%M:%S}] Inicio: {app_path(app['bat'])}\n")
             log.flush()
             result = subprocess.run(
                 [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", "call", str(app_path(app["bat"]))],
                 cwd=app_path(app["cwd"]), stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
                 creationflags=subprocess.CREATE_NO_WINDOW,
+                env=environment,
             )
             log.write(f"\n[{datetime.now():%Y-%m-%d %H:%M:%S}] Fin: codigo {result.returncode}\n")
             return result.returncode
@@ -836,10 +909,14 @@ class ServiceDialog(tk.Toplevel):
         self.resizable(False, False)
         self.fields = {}
         self.auto_ports = tk.BooleanVar(value=app.get("port_mode", "manual") == "auto" if app else True)
-        rows = [("Nombre", "name"), ("Archivo BAT", "bat"), ("URL publica", "url"), ("Puertos", "ports"), ("Carpeta", "cwd"), ("Logs", "logs")]
+        self.remove_key = tk.BooleanVar(value=False)
+        self.saved_key = app.get("inference_key_protected", "") if app else ""
+        rows = [("Nombre", "name"), ("Archivo BAT / CMD", "bat"), ("URL publica", "url"), ("Clave IA (opcional)", "inference_key"), ("Puertos", "ports"), ("Carpeta", "cwd"), ("Logs", "logs")]
         for i, (label, key) in enumerate(rows):
             tk.Label(self, text=label, fg=TEXT, bg=BG).grid(row=i, column=0, sticky="w", padx=12, pady=6)
             entry = ttk.Entry(self, width=60)
+            if key == "inference_key":
+                entry.configure(show="*")
             entry.grid(row=i, column=1, padx=8, pady=6)
             self.fields[key] = entry
             if key in ("bat", "cwd", "logs"):
@@ -856,9 +933,11 @@ class ServiceDialog(tk.Toplevel):
         self.fields["bat"].bind("<FocusOut>", lambda e: self.detect())
         ttk.Checkbutton(self, text="Actualizar puertos desde el BAT en cada arranque", variable=self.auto_ports, command=self.toggle_ports).grid(row=len(rows), column=1, sticky="w", padx=8, pady=8)
         self.detection = tk.Label(self, text="", fg=MUTED, bg=BG, wraplength=450, justify="left")
-        self.detection.grid(row=len(rows) + 1, column=1, sticky="w", padx=8)
+        self.detection.grid(row=len(rows) + 2, column=1, sticky="w", padx=8)
+        if self.saved_key:
+            ttk.Checkbutton(self, text="Eliminar clave IA guardada", variable=self.remove_key).grid(row=len(rows) + 1, column=1, sticky="w", padx=8)
         buttons = tk.Frame(self, bg=BG)
-        buttons.grid(row=len(rows) + 2, column=0, columnspan=3, sticky="e", padx=12, pady=12)
+        buttons.grid(row=len(rows) + 3, column=0, columnspan=3, sticky="e", padx=12, pady=12)
         ttk.Button(buttons, text="Guardar", command=self.save, style="Primary.TButton").pack(side="right", padx=4)
         ttk.Button(buttons, text="Cancelar", command=self.destroy).pack(side="right", padx=4)
         self.toggle_ports()
@@ -889,7 +968,7 @@ class ServiceDialog(tk.Toplevel):
 
     def pick(self, key):
         if key == "bat":
-            value = filedialog.askopenfilename(filetypes=[("Batch", "*.bat"), ("Todos", "*.*")])
+            value = filedialog.askopenfilename(filetypes=[("Lanzadores Windows", "*.bat *.cmd"), ("Todos", "*.*")])
             if value:
                 self.fields["bat"].delete(0, "end")
                 self.fields["bat"].insert(0, value)
@@ -927,8 +1006,8 @@ class ServiceDialog(tk.Toplevel):
         if not name or not bat:
             messagebox.showerror("Faltan datos", "Nombre y BAT son obligatorios.")
             return
-        if not app_path(bat).is_file() or app_path(bat).suffix.lower() != ".bat":
-            messagebox.showerror("BAT no existe", str(app_path(bat)))
+        if not app_path(bat).is_file() or app_path(bat).suffix.lower() not in (".bat", ".cmd"):
+            messagebox.showerror("Selecciona un BAT o CMD existente", str(app_path(bat)))
             return
         if not app_path(cwd).is_dir():
             messagebox.showerror("Carpeta no existe", str(app_path(cwd)))
@@ -948,6 +1027,14 @@ class ServiceDialog(tk.Toplevel):
             messagebox.showerror("Servicio existente", "Ya existe un servicio con ese nombre.")
             return
         try:
+            key = self.fields["inference_key"].get()
+            if key:
+                if len(key) < 24:
+                    messagebox.showerror("Clave IA invalida", "La clave debe tener al menos 24 caracteres.")
+                    return
+                app["inference_key_protected"] = base64.b64encode(crypt_secret(key.encode("utf-8"))).decode("ascii")
+            elif self.saved_key and not self.remove_key.get():
+                app["inference_key_protected"] = self.saved_key
             app["url_mode"] = "auto" if inspect_bat(bat)["url"] == url else "manual"
             sync_bat(app)
         except OSError as exc:

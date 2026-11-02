@@ -1,4 +1,5 @@
 import tempfile
+import json
 import socket
 import unittest
 from pathlib import Path
@@ -9,6 +10,23 @@ import deployer_panel as panel
 
 
 class LaunchCheck(unittest.TestCase):
+    def test_cmd_linked_scripts_are_detected_and_rechecked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "scripts").mkdir()
+            launcher = root / "iniciar-todo.cmd"
+            launcher.write_text('powershell.exe -File "%~dp0scripts\\start.ps1"\n', encoding="utf-8")
+            (root / "scripts/start.ps1").write_text("$env:INFERENCE_URL='http://server:4110'\n& pnpm.cmd dev\n", encoding="utf-8")
+            (root / "package.json").write_text(json.dumps({"scripts": {"dev": "node scripts/start-all.mjs"}}), encoding="utf-8")
+            script = root / "scripts/start-all.mjs"
+            script.write_text('const services=[{command:"pnpm start --port 4321",url:"http://localhost:4100"},{url:"http://localhost:5173"}];', encoding="utf-8")
+            app = {"bat": str(launcher), "port_mode": "auto"}
+            self.assertTrue(panel.sync_bat(app))
+            self.assertEqual(app["ports"], [4100, 4321, 5173])
+            script.write_text('const services=[{url:"http://localhost:5180"}];', encoding="utf-8")
+            self.assertTrue(panel.sync_bat(app))
+            self.assertEqual(app["ports"], [5180])
+
     def test_open_console_only_follows_logs_and_never_launches_bat(self):
         with tempfile.TemporaryDirectory() as directory:
             card = SimpleNamespace(app={"task": "Deployer_FODA", "name": "FODA", "bat": "start_frontend.bat"}, app_ui=SimpleNamespace(log=Mock()))
@@ -35,7 +53,7 @@ class LaunchCheck(unittest.TestCase):
 
     def test_bat_changes_refresh_detected_values_but_keep_manual_values(self):
         with tempfile.TemporaryDirectory() as directory:
-            bat = Path(directory) / "start.bat"
+            bat = Path(directory) / "start.cmd"
             bat.write_text('rem --port 9999\nset "FRONTEND_PORT=7004"\nset "PUBLIC_URL=https://demo.example"\nset "WORKSTATION_URL=http://192.168.0.103:9090"\ncall npm run preview -- --port %FRONTEND_PORT%\n', encoding="utf-8")
             app = {"bat": str(bat), "port_mode": "auto", "url_mode": "auto"}
             self.assertTrue(panel.sync_bat(app))
@@ -54,7 +72,7 @@ class LaunchCheck(unittest.TestCase):
 
     def test_add_service_and_recheck_before_launch(self):
         with tempfile.TemporaryDirectory() as directory:
-            bat = Path(directory) / "start.bat"
+            bat = Path(directory) / "start.cmd"
             bat.write_text('set "PORT=7004"\nset "PUBLIC_URL=https://demo.example"\n', encoding="utf-8")
             config = {"cloudflared_service": "cloudflared", "apps": []}
             with patch.object(panel, "load_config", return_value=config), patch.object(panel, "save_config"), patch.object(panel.App, "refresh"), patch.object(panel.App, "refresh_log"), patch.object(panel.App, "after"):
@@ -63,6 +81,8 @@ class LaunchCheck(unittest.TestCase):
                     self.assertEqual(list(ui.cards), [])
                     dialog = panel.ServiceDialog(ui)
                     dialog.fields["name"].insert(0, "Demo")
+                    secret = "test-only-inference-key-123456"
+                    dialog.fields["inference_key"].insert(0, secret)
                     with patch.object(panel.filedialog, "askopenfilename", return_value=str(bat)):
                         dialog.pick("bat")
                     self.assertEqual(dialog.fields["ports"].get(), "7004")
@@ -70,6 +90,13 @@ class LaunchCheck(unittest.TestCase):
                     dialog.save()
                     self.assertEqual(config["apps"][0]["cwd"], str(bat.parent))
                     self.assertEqual(config["apps"][0]["port_mode"], "auto")
+                    protected = config["apps"][0]["inference_key_protected"]
+                    self.assertNotIn(secret, json.dumps(config))
+                    self.assertEqual(panel.crypt_secret(panel.base64.b64decode(protected), decrypt=True).decode(), secret)
+                    editing = panel.ServiceDialog(ui, config["apps"][0])
+                    self.assertEqual(editing.fields["inference_key"].get(), "")
+                    editing.save()
+                    self.assertEqual(config["apps"][0]["inference_key_protected"], protected)
                     bat.write_text('set "PORT=7010"\nset "PUBLIC_URL=https://new.example"\n', encoding="utf-8")
                     card = ui.cards["demo"]
                     with patch.object(panel, "create_task"), patch.object(card, "_run", return_value="requested"):
@@ -179,13 +206,18 @@ class LaunchCheck(unittest.TestCase):
             bat = root / "test runner.bat"
             bat.write_text('@echo off\necho runner-output\nexit /b 7\n', encoding="utf-8")
             config = {"apps": [{"bat": str(bat), "cwd": str(root), "task": "Test"}]}
+            secret = "test-only-inference-key-123456"
+            config["apps"][0]["inference_key_protected"] = panel.base64.b64encode(panel.crypt_secret(secret.encode())).decode()
             original_run = panel.subprocess.run
             with patch.object(panel, "load_config", return_value=config), patch.object(panel, "LOG_DIR", root), patch.object(panel.subprocess, "run", wraps=original_run) as execute:
                 self.assertEqual(panel.run_task("Test"), 7)
                 self.assertEqual(execute.call_args.kwargs["creationflags"], panel.subprocess.CREATE_NO_WINDOW)
+                self.assertEqual(execute.call_args.kwargs["env"]["INFERENCE_API_KEY"], secret)
+                self.assertNotIn(secret, str(execute.call_args.args[0]))
             output = (root / "Test.log").read_text(encoding="utf-8")
             self.assertIn("runner-output", output)
             self.assertIn("Fin: codigo 7", output)
+            self.assertNotIn(secret, output)
 
     def test_cpu_percentage_uses_elapsed_time_and_process_identity(self):
         first = SimpleNamespace(returncode=0, stdout='{"Id":123,"Started":1,"CPU":100,"WorkingSet64":104857600}')
