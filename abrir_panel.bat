@@ -1,4 +1,4 @@
 @echo off
 cd /d "%~dp0"
-python deployer_panel.py
-pause
+start "" pythonw "%~dp0deployer_panel.py"
+exit /b

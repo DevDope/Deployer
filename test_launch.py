@@ -60,10 +60,24 @@ class LaunchCheck(unittest.TestCase):
                     self.assertEqual(config["apps"][0]["port_mode"], "auto")
                     bat.write_text('set "PORT=7010"\nset "PUBLIC_URL=https://new.example"\n', encoding="utf-8")
                     card = ui.cards["demo"]
-                    with patch.object(panel, "task_exists", return_value=True), patch.object(card, "_run", return_value="requested"):
+                    with patch.object(panel, "task_exists", return_value=True), patch.object(panel, "create_task"), patch.object(card, "_run", return_value="requested"):
                         self.assertEqual(card._start(), "requested")
                     self.assertEqual(card.app["ports"], [7010])
                     self.assertEqual(card.app["url"], "https://new.example")
+                    ui.update()
+                    ui.select_service()
+                    with patch.object(panel.webbrowser, "open") as open_url:
+                        ui.site_link.event_generate("<Button-1>")
+                        self.assertEqual(open_url.call_args.args[0], "https://new.example")
+                    ui.chart.record("demo", {"cpu_percent": 4, "ram_mb": 50})
+                    ui.chart.record("demo", {"cpu_percent": 8, "ram_mb": 56})
+                    ui.chart.draw()
+                    self.assertGreater(len(ui.chart.find_all()), 6)
+                    for size in ("1260x780", "960x640"):
+                        ui.geometry(size)
+                        ui.update()
+                        self.assertLess(ui.chart.winfo_rooty() + ui.chart.winfo_height(), ui.notebook.winfo_rooty())
+                        self.assertGreater(ui.log_view.winfo_height(), 30)
                     bat.write_text('set "PORT=7020"\n', encoding="utf-8")
                     reopened = panel.App()
                     try:
@@ -86,12 +100,14 @@ class LaunchCheck(unittest.TestCase):
                     ui.update()
                     for frame in (ui.actions, ui.secondary):
                         for button in frame.winfo_children():
+                            if button.winfo_manager() != "pack":
+                                continue
                             self.assertGreater(button.winfo_width(), 30)
                             self.assertLessEqual(button.winfo_rootx() + button.winfo_width(), ui.winfo_rootx() + ui.winfo_width())
                 ui.service_list.selection_set("__cloud__")
                 ui.select_service()
                 self.assertEqual(ui.detail_title.cget("text"), "Cloudflared")
-                self.assertEqual(len(ui.actions.winfo_children()), 3)
+                self.assertEqual(sum(w.winfo_manager() == "pack" for w in ui.actions.winfo_children()), 4)
                 self.assertEqual(len(ui.service_list.get_children()), len(ui.config_data["apps"]) + 1)
             finally:
                 ui.destroy()
@@ -126,7 +142,32 @@ class LaunchCheck(unittest.TestCase):
         self.assertIn("-LogonType Interactive -RunLevel Highest", script)
         self.assertIn("-Principal $principal", script)
         self.assertIn("-WorkingDirectory", script)
-        self.assertIn('call "', script)
+        self.assertIn("pythonw.exe", script)
+        self.assertIn("--run-task Deployer_Check", script)
+
+    def test_hidden_runner_keeps_log_and_exit_code(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bat = root / "test runner.bat"
+            bat.write_text('@echo off\necho runner-output\nexit /b 7\n', encoding="utf-8")
+            config = {"apps": [{"bat": str(bat), "cwd": str(root), "task": "Test"}]}
+            original_run = panel.subprocess.run
+            with patch.object(panel, "load_config", return_value=config), patch.object(panel, "LOG_DIR", root), patch.object(panel.subprocess, "run", wraps=original_run) as execute:
+                self.assertEqual(panel.run_task("Test"), 7)
+                self.assertEqual(execute.call_args.kwargs["creationflags"], panel.subprocess.CREATE_NO_WINDOW)
+            output = (root / "Test.log").read_text(encoding="utf-8")
+            self.assertIn("runner-output", output)
+            self.assertIn("Fin: codigo 7", output)
+
+    def test_cpu_percentage_uses_elapsed_time_and_process_identity(self):
+        first = SimpleNamespace(returncode=0, stdout='{"Id":123,"Started":1,"CPU":100,"WorkingSet64":104857600}')
+        second = SimpleNamespace(returncode=0, stdout='{"Id":123,"Started":1,"CPU":104,"WorkingSet64":209715200}')
+        with patch.object(panel, "ps", side_effect=[first, second]), patch.object(panel.time, "monotonic", side_effect=[10, 12]), patch.object(panel.os, "cpu_count", return_value=4):
+            initial = panel.process_metrics(["123"])
+            latest = panel.process_metrics(["123"], initial)
+        self.assertIsNone(initial["cpu_percent"])
+        self.assertEqual(latest["cpu_percent"], 50)
+        self.assertEqual(latest["ram_mb"], 200)
 
     def test_wrapper_reports_missing_original_without_running_application(self):
         with tempfile.TemporaryDirectory() as directory:

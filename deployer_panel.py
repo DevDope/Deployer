@@ -1,12 +1,16 @@
 import json
 import hashlib
+import os
 import queue
 import re
 import subprocess
+import sys
 import threading
+import time
 import tkinter as tk
 import webbrowser
 from datetime import datetime
+from collections import deque
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from urllib.parse import urlsplit
@@ -17,7 +21,7 @@ CONFIG = ROOT / "services.json"
 LOG_DIR = ROOT / "panel_logs"
 MANAGED_BATS = ROOT / "managed_bats"
 ADDRESSES = ROOT / "direcciones.txt"
-VERSION = "v3.2"
+VERSION = "v3.3"
 LOG_DIR.mkdir(exist_ok=True)
 MANAGED_BATS.mkdir(exist_ok=True)
 
@@ -33,7 +37,8 @@ MUTED = "#66717e"
 
 
 def run(args, timeout=8):
-    return subprocess.run(args, text=True, capture_output=True, timeout=timeout, shell=False)
+    return subprocess.run(args, text=True, capture_output=True, timeout=timeout, shell=False,
+                          creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
 
 
 def ps(script, timeout=8):
@@ -188,20 +193,32 @@ def diagnostic_report(config):
     return f"[OK] Diagnostico guardado en {report}"
 
 
-def process_metrics(pids):
+def process_metrics(pids, previous=None):
     if not pids:
-        return "CPU -- | RAM --"
+        return {"cpu_percent": 0.0, "ram_mb": 0.0, "processes": {}, "time": time.monotonic()}
     script = (
         "$pids=@(" + ",".join(pids) + ");"
         "$ps=Get-Process -Id $pids -ErrorAction SilentlyContinue;"
-        "$ram=($ps | Measure-Object WorkingSet64 -Sum).Sum;"
-        "$cpu=($ps | Measure-Object CPU -Sum).Sum;"
-        "'CPU {0:n1}s | RAM {1:n0} MB' -f $cpu, ($ram/1MB)"
+        "$ps | Select-Object Id,CPU,WorkingSet64,@{n='Started';e={$_.StartTime.Ticks}} | ConvertTo-Json -Compress"
     )
     try:
-        return ps(script, timeout=4).stdout.strip() or "CPU -- | RAM --"
-    except subprocess.TimeoutExpired:
-        return "CPU -- | RAM --"
+        result = ps(script, timeout=8)
+        if result.returncode or not result.stdout.strip():
+            return {}
+        records = json.loads(result.stdout)
+        records = records if isinstance(records, list) else [records]
+        now = time.monotonic()
+        processes = {f"{p['Id']}:{p['Started']}": float(p.get("CPU") or 0) for p in records}
+        cpu = None
+        if previous and now > previous.get("time", now):
+            common = processes.keys() & previous.get("processes", {}).keys()
+            if common:
+                delta = sum(max(0, processes[key] - previous["processes"][key]) for key in common)
+                cpu = min(100, 100 * delta / (now - previous["time"]) / (os.cpu_count() or 1))
+        return {"cpu_percent": cpu, "ram_mb": sum(p["WorkingSet64"] for p in records) / 1048576,
+                "processes": processes, "time": now}
+    except (subprocess.TimeoutExpired, ValueError, KeyError, TypeError):
+        return {}
 
 
 def latest_log(path):
@@ -237,8 +254,10 @@ def read_tail(paths, lines=120):
 
 def create_task(app):
     task = app["task"]
-    log = LOG_DIR / f"{task}.log"
-    command = f'cd /d "{app_path(app["cwd"])}" && call "{app_path(app["bat"])}" >> "{log}" 2>&1'
+    pythonw = Path(sys.executable).with_name("pythonw.exe")
+    if not pythonw.is_file():
+        raise FileNotFoundError(f"No existe {pythonw}. Se necesita pythonw para ejecutar sin consola.")
+    arguments = subprocess.list2cmdline([str(Path(__file__).resolve()), "--run-task", task])
     quote = lambda value: "'" + str(value).replace("'", "''") + "'"
     script = (
         "$ErrorActionPreference='Stop';"
@@ -247,7 +266,7 @@ def create_task(app):
         "if(-not $user.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))"
         "{throw 'Abre el panel como administrador para instalar las tareas.'};"
         "$principal=New-ScheduledTaskPrincipal -UserId $identity.Name -LogonType Interactive -RunLevel Highest;"
-        f"$action=New-ScheduledTaskAction -Execute 'cmd.exe' -Argument {quote('/d /c ' + command)} "
+        f"$action=New-ScheduledTaskAction -Execute {quote(pythonw)} -Argument {quote(arguments)} "
         f"-WorkingDirectory {quote(app_path(app['cwd']))};"
         "$settings=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries "
         "-ExecutionTimeLimit (New-TimeSpan -Hours 0);"
@@ -256,6 +275,26 @@ def create_task(app):
     r = ps(script)
     if r.returncode:
         raise RuntimeError(r.stderr or r.stdout or f"No se pudo instalar {task}")
+    app["runner_version"] = 1
+
+
+def run_task(name):
+    app = next(app for app in load_config()["apps"] if app["task"] == name)
+    with (LOG_DIR / f"{name}.log").open("a", encoding="utf-8") as log:
+        try:
+            sync_bat(app)
+            log.write(f"\n[{datetime.now():%Y-%m-%d %H:%M:%S}] Inicio: {app_path(app['bat'])}\n")
+            log.flush()
+            result = subprocess.run(
+                [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", "call", str(app_path(app["bat"]))],
+                cwd=app_path(app["cwd"]), stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            log.write(f"\n[{datetime.now():%Y-%m-%d %H:%M:%S}] Fin: codigo {result.returncode}\n")
+            return result.returncode
+        except Exception as exc:
+            log.write(f"[ERROR] {exc}\n")
+            return 1
 
 
 def write_wrapper(name, target):
@@ -320,6 +359,47 @@ def service_status(snap, ports):
     return "Sin puertos activos", MUTED
 
 
+class MetricChart(tk.Canvas):
+    def __init__(self, parent):
+        super().__init__(parent, height=96, bg="#111214", highlightthickness=0)
+        self.history = {}
+        self.key = None
+        self.bind("<Configure>", lambda e: self.draw())
+
+    def record(self, key, sample):
+        self.history.setdefault(key, deque(maxlen=60)).append(sample)
+
+    def draw(self):
+        self.delete("all")
+        samples = self.history.get(self.key, [])
+        latest = samples[-1] if samples else {}
+        half = self.winfo_width() / 2
+        for index, (name, field, unit) in enumerate((("CPU", "cpu_percent", "%"), ("RAM", "ram_mb", "MB"))):
+            left = index * half
+            cx, cy, r = left + 38, 51, 25
+            self.create_polygon(cx-r, cy, cx-r/2, cy-r, cx+r/2, cy-r, cx+r, cy, cx+r/2, cy+r, cx-r/2, cy+r,
+                                outline="#555a60", fill="", width=1)
+            self.create_text(cx, cy, text=name, fill="#b5bac2", font=("Segoe UI", 9, "bold"))
+            value = latest.get(field)
+            label = "--" if value is None else f"{value:.1f} {unit}"
+            self.create_text(left + 78, 28, text=label, anchor="w", fill="#f3f4f6", font=("Segoe UI", 17))
+            points = [sample.get(field) for sample in samples]
+            ceiling = 100 if field == "cpu_percent" else max([v for v in points if v is not None] + [1]) * 1.15
+            start, end = left + 78, left + half - 14
+            self.create_line(start, 84, end, 84, fill="#34373b")
+            segment = []
+            for j, value in enumerate(points):
+                if value is None:
+                    if len(segment) >= 4:
+                        self.create_line(*segment, fill="#e1e4e8", width=1.5)
+                    segment = []
+                    continue
+                segment.extend((start + j / max(1, len(points)-1) * max(1, end-start), 82 - min(1, value/ceiling) * 30))
+            if len(segment) >= 4:
+                self.create_line(*segment, fill="#e1e4e8", width=1.5)
+        self.create_line(half, 18, half, 90, fill="#34373b")
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -333,6 +413,7 @@ class App(tk.Tk):
         self.selected_log = None
         self.selected_key = None
         self.snapshots = {}
+        self.metric_samples = {}
         self.log_running = False
         self.auto_refresh = tk.BooleanVar(value=True)
         self.scan_running = False
@@ -404,17 +485,23 @@ class App(tk.Tk):
         self.detail_status.pack(fill="x", padx=(20, 0))
         self.detail_paths = tk.Label(right, bg=BG, fg=MUTED, anchor="w", justify="left", wraplength=560)
         self.detail_paths.pack(fill="x", padx=(20, 0), pady=(10, 12))
-        right.bind("<Configure>", lambda e: (self.detail_paths.configure(wraplength=max(200, e.width - 24)), self.detail_status.configure(wraplength=max(200, e.width - 24))))
+        self.site_link = tk.Label(right, bg=BG, fg=CYAN, anchor="w", justify="left", cursor="hand2", font=("Segoe UI", 10, "underline"), takefocus=True)
+        self.site_link.bind("<Button-1>", lambda e: self.open_site())
+        self.site_link.bind("<Return>", lambda e: self.open_site())
+        self.site_link.bind("<space>", lambda e: self.open_site())
+        self.chart = MetricChart(right)
+        right.bind("<Configure>", lambda e: (self.detail_paths.configure(wraplength=max(200, e.width - 24)), self.detail_status.configure(wraplength=max(200, e.width - 24)), self.site_link.configure(wraplength=max(200, e.width - 24))))
         self.actions = tk.Frame(right, bg=BG)
         self.actions.pack(fill="x", padx=(20, 0), pady=(0, 12))
         self.secondary = tk.Frame(right, bg=BG)
-        self.secondary.pack(fill="x", padx=(20, 0), pady=(0, 12))
         self.notebook = ttk.Notebook(right)
         self.notebook.pack(fill="both", expand=True, padx=(20, 0))
         logs = tk.Frame(self.notebook, bg=PANEL)
         events = tk.Frame(self.notebook, bg=PANEL)
+        details = tk.Frame(self.notebook, bg=PANEL)
         self.notebook.add(logs, text="Logs")
         self.notebook.add(events, text="Actividad")
+        self.notebook.add(details, text="Detalles")
         log_top = tk.Frame(logs, bg=PANEL)
         log_top.pack(fill="x")
         self.log_source = tk.StringVar(value="Salida del panel")
@@ -424,6 +511,7 @@ class App(tk.Tk):
         ttk.Button(log_top, text="Actualizar log", command=self.refresh_log).pack(side="right", padx=8)
         self.log_view = self.text_area(logs)
         self.events = self.text_area(events)
+        self.info_view = self.text_area(details)
         self.log_path = tk.Label(logs, text="", bg=PANEL, fg=MUTED, anchor="w", wraplength=550)
         self.log_path.pack(side="bottom", before=self.log_view.master, fill="x", padx=10, pady=6)
         footer = tk.Frame(self, bg=BG)
@@ -474,28 +562,50 @@ class App(tk.Tk):
             command = (lambda a=action: self.cloud.control(a)) if cloud else (controller.start, controller.stop, controller.restart)[i]
             ttk.Button(self.actions, text=label, command=command, style="Primary.TButton" if i == 0 else "TButton").pack(side="left", padx=(0, 8))
         if cloud:
-            ttk.Button(self.secondary, text="Configurar servicio", command=self.configure_cloud).pack(side="left")
+            self.site_link.pack_forget()
+            self.chart.pack_forget()
+            self.action_menu = tk.Menu(self.actions, tearoff=False)
+            self.action_menu.add_command(label="Configurar servicio", command=self.configure_cloud)
             self.selected_log = None
             self.set_log("Cloudflared se controla mediante el servicio de Windows.")
         else:
-            if controller.app.get("url"):
-                ttk.Button(self.actions, text="Abrir URL", command=lambda: webbrowser.open(controller.app["url"])).pack(side="left")
+            self.site_link.pack(before=self.actions, fill="x", padx=(20, 0), pady=(0, 10))
+            self.chart.pack(before=self.actions, fill="x", padx=(20, 0), pady=(0, 12))
+            self.action_menu = tk.Menu(self.actions, tearoff=False)
             for label, command in (("Abrir CMD", controller.open_cmd), ("Instalar tarea", controller.install), ("Editar", lambda: self.edit_service(controller.app)), ("Quitar", lambda: self.delete_service(controller.app))):
-                ttk.Button(self.secondary, text=label, command=command).pack(side="left", padx=(0, 6))
+                self.action_menu.add_command(label=label, command=command)
             self.select_log_source()
+        ttk.Menubutton(self.actions, text="Mas", menu=self.action_menu).pack(side="left")
         self.update_detail()
 
     def update_detail(self):
         if self.selected_key == "__cloud__":
             self.detail_status.configure(text=getattr(self.cloud, "state", "Sin consultar"), fg=MUTED)
             self.detail_paths.configure(text=f"Servicio de Windows: {self.cloud.service}")
+            info = f"Servicio de Windows: {self.cloud.service}"
         elif self.selected_key in self.cards:
             app = self.cards[self.selected_key].app
             snap = self.snapshots.get(self.selected_key, {})
             status, color = service_status(snap, app.get("ports", []))
-            self.detail_status.configure(text=f"{status}   |   {snap.get('metrics', 'CPU -- | RAM --')}   |   Tarea: {snap.get('state', 'Sin consultar')}", fg=color)
+            self.detail_status.configure(text=f"{status}   |   Tarea: {snap.get('state', 'Sin consultar')}", fg=color)
             ports = "   ".join(f"{p}: {'activo' if ok else 'cerrado'}" for p, ok in snap.get("statuses", [])) or ("Puertos sin consultar" if app.get("ports") else "Puerto no detectado")
-            self.detail_paths.configure(text=f"{ports}\nURL: {app.get('url') or 'Sin configurar'}\n\nBAT: {app_path(app['bat'])}\nCarpeta: {app_path(app['cwd'])}")
+            self.detail_paths.configure(text=ports)
+            info = f"BAT: {app_path(app['bat'])}\n\nCarpeta: {app_path(app['cwd'])}\n\nTarea: {app['task']}\n\nURL: {app.get('url', '')}"
+            self.site_link.configure(text=app.get("url") or "Sin URL configurada")
+            self.chart.key = self.selected_key
+            self.chart.draw()
+        else:
+            return
+        self.info_view.configure(state="normal")
+        self.info_view.delete("1.0", "end")
+        self.info_view.insert("end", info)
+        self.info_view.configure(state="disabled")
+
+    def open_site(self):
+        if self.selected_key in self.cards:
+            url = self.cards[self.selected_key].app.get("url", "")
+            if urlsplit(url).scheme in ("http", "https"):
+                webbrowser.open(url)
 
     def configure_cloud(self):
         from tkinter.simpledialog import askstring
@@ -573,7 +683,7 @@ class App(tk.Tk):
                     "state": state,
                     "statuses": statuses,
                     "pids": pids,
-                    "metrics": process_metrics(pids),
+                    "metrics": process_metrics(pids, self.metric_samples.get(app["key"])),
                     "missing": not app_path(app["bat"]).exists(),
                 }
             service = self.config_data.get("cloudflared_service", "cloudflared").replace("'", "''")
@@ -588,6 +698,10 @@ class App(tk.Tk):
 
     def apply_scan(self, scan):
         self.snapshots = scan["apps"]
+        for key, snap in scan["apps"].items():
+            sample = snap.get("metrics", {})
+            self.metric_samples[key] = sample
+            self.chart.record(key, sample)
         active = ports_ok = total_ports = missing = 0
         for key, card in self.cards.items():
             state = card.apply_snapshot(scan["apps"].get(key, {}))
@@ -887,7 +1001,7 @@ class ServiceCard(tk.Frame):
         except OSError as exc:
             messagebox.showerror("No se pudo leer el BAT", str(exc))
             return
-        subprocess.Popen(["cmd", "/k", f'cd /d "{app_path(self.app["cwd"])}" && call "{bat}"'], creationflags=subprocess.CREATE_NEW_CONSOLE)
+        subprocess.Popen(["cmd", "/d", "/k", "call", str(bat)], cwd=app_path(self.app["cwd"]), creationflags=subprocess.CREATE_NEW_CONSOLE)
         self.app_ui.log(f"[CMD] {self.app['name']} abierto en consola.")
 
     def open_logs(self):
@@ -900,7 +1014,7 @@ class ServiceCard(tk.Frame):
 
     def _start(self):
         self.app_ui.sync_service(self.app)
-        if self.app.get("task_dirty") or not task_exists(self.app["task"]):
+        if self.app.get("runner_version") != 1 or self.app.get("task_dirty") or not task_exists(self.app["task"]):
             create_task(self.app)
             self.app["task_dirty"] = False
             save_config(self.app_ui.config_data)
@@ -927,4 +1041,6 @@ class CloudCard(tk.Frame):
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "--run-task":
+        sys.exit(run_task(sys.argv[2]))
     App().mainloop()
