@@ -21,7 +21,7 @@ CONFIG = ROOT / "services.json"
 LOG_DIR = ROOT / "panel_logs"
 MANAGED_BATS = ROOT / "managed_bats"
 ADDRESSES = ROOT / "direcciones.txt"
-VERSION = "v3.3"
+VERSION = "v3.4"
 LOG_DIR.mkdir(exist_ok=True)
 MANAGED_BATS.mkdir(exist_ok=True)
 
@@ -744,6 +744,7 @@ class App(tk.Tk):
         self.refresh_log()
 
     def show_logs(self, app):
+        self.log_source.set("Salida del panel")
         self.service_list.selection_set(app["key"])
         self.select_service()
         self.notebook.select(0)
@@ -976,6 +977,7 @@ class ServiceCard(tk.Frame):
         self.app_ui.install_one(self.app)
 
     def start(self):
+        self.app_ui.show_logs(self.app)
         self.app_ui.bg(self._start)
 
     def stop(self):
@@ -992,17 +994,17 @@ class ServiceCard(tk.Frame):
         self.app_ui.bg(work)
 
     def open_cmd(self):
-        bat = app_path(self.app["bat"])
-        if not bat.exists():
-            messagebox.showerror("No existe", str(bat))
-            return
+        log = LOG_DIR / f"{self.app['task']}.log"
         try:
-            self.app_ui.sync_service(self.app)
+            log.touch(exist_ok=True)
+            path = str(log).replace("'", "''")
+            title = (self.app["name"] + " | Logs").replace("'", "''")
+            script = f"$Host.UI.RawUI.WindowTitle='{title}'; Get-Content -LiteralPath '{path}' -Tail 80 -Wait"
+            subprocess.Popen(["powershell", "-NoProfile", "-Command", script], creationflags=subprocess.CREATE_NEW_CONSOLE)
         except OSError as exc:
-            messagebox.showerror("No se pudo leer el BAT", str(exc))
+            messagebox.showerror("No se pudo abrir la consola de logs", str(exc))
             return
-        subprocess.Popen(["cmd", "/d", "/k", "call", str(bat)], cwd=app_path(self.app["cwd"]), creationflags=subprocess.CREATE_NEW_CONSOLE)
-        self.app_ui.log(f"[CMD] {self.app['name']} abierto en consola.")
+        self.app_ui.log(f"[LOGS] Consola de {self.app['name']} abierta. Cerrarla no detiene la tarea.")
 
     def open_logs(self):
         self.app_ui.show_logs(self.app)

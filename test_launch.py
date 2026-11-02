@@ -3,12 +3,24 @@ import socket
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import deployer_panel as panel
 
 
 class LaunchCheck(unittest.TestCase):
+    def test_open_console_only_follows_logs_and_never_launches_bat(self):
+        with tempfile.TemporaryDirectory() as directory:
+            card = SimpleNamespace(app={"task": "Deployer_FODA", "name": "FODA", "bat": "start_frontend.bat"}, app_ui=SimpleNamespace(log=Mock()))
+            with patch.object(panel, "LOG_DIR", Path(directory)), patch.object(panel.subprocess, "Popen") as launch:
+                panel.ServiceCard.open_cmd(card)
+            command = launch.call_args.args[0]
+            self.assertEqual(command[0], "powershell")
+            self.assertIn("Get-Content -LiteralPath", command[-1])
+            self.assertIn("-Wait", command[-1])
+            self.assertNotIn("start_frontend.bat", " ".join(command))
+            self.assertTrue((Path(directory) / "Deployer_FODA.log").is_file())
+
     def test_project_local_bat_requires_its_manifest(self):
         with tempfile.TemporaryDirectory() as directory:
             bat = Path(directory) / "iniciar.bat"
