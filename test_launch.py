@@ -213,6 +213,7 @@ class LaunchCheck(unittest.TestCase):
                 self.assertEqual(panel.run_task("Test"), 7)
                 self.assertEqual(execute.call_args.kwargs["creationflags"], panel.subprocess.CREATE_NO_WINDOW)
                 self.assertEqual(execute.call_args.kwargs["env"]["INFERENCE_API_KEY"], secret)
+                self.assertEqual(execute.call_args.kwargs["env"]["DEPLOYER_MANAGED"], "1")
                 self.assertNotIn(secret, str(execute.call_args.args[0]))
             output = (root / "Test.log").read_text(encoding="utf-8")
             self.assertIn("runner-output", output)

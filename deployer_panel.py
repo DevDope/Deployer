@@ -23,7 +23,7 @@ CONFIG = ROOT / "services.json"
 LOG_DIR = ROOT / "panel_logs"
 MANAGED_BATS = ROOT / "managed_bats"
 ADDRESSES = ROOT / "direcciones.txt"
-VERSION = "v3.6"
+VERSION = "v3.7"
 LOG_DIR.mkdir(exist_ok=True)
 MANAGED_BATS.mkdir(exist_ok=True)
 
@@ -353,6 +353,7 @@ def run_task(name):
         try:
             sync_bat(app)
             environment = os.environ.copy()
+            environment["DEPLOYER_MANAGED"] = "1"
             if app.get("inference_key_protected"):
                 environment["INFERENCE_API_KEY"] = crypt_secret(base64.b64decode(app["inference_key_protected"]), decrypt=True).decode("utf-8")
             log.write(f"\n[{datetime.now():%Y-%m-%d %H:%M:%S}] Inicio: {app_path(app['bat'])}\n")
