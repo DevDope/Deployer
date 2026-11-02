@@ -72,7 +72,7 @@ class LaunchCheck(unittest.TestCase):
                     self.assertEqual(config["apps"][0]["port_mode"], "auto")
                     bat.write_text('set "PORT=7010"\nset "PUBLIC_URL=https://new.example"\n', encoding="utf-8")
                     card = ui.cards["demo"]
-                    with patch.object(panel, "task_exists", return_value=True), patch.object(panel, "create_task"), patch.object(card, "_run", return_value="requested"):
+                    with patch.object(panel, "create_task"), patch.object(card, "_run", return_value="requested"):
                         self.assertEqual(card._start(), "requested")
                     self.assertEqual(card.app["ports"], [7010])
                     self.assertEqual(card.app["url"], "https://new.example")
@@ -156,6 +156,22 @@ class LaunchCheck(unittest.TestCase):
         self.assertIn("-WorkingDirectory", script)
         self.assertIn("pythonw.exe", script)
         self.assertIn("--run-task Deployer_Check", script)
+        self.assertIn("$registered=Get-ScheduledTask", script)
+        self.assertIn("$registered.Actions[0].Arguments -ne $action.Arguments", script)
+
+    def test_start_replaces_stale_task_even_when_config_claims_current_runner(self):
+        app = {"task": "Deployer_FODA", "runner_version": 1, "task_dirty": False}
+        events = []
+        controller = SimpleNamespace(app=app, app_ui=SimpleNamespace(sync_service=Mock(), config_data={"apps": [app]}),
+                                     _run=Mock(side_effect=lambda *args: events.append("run") or "requested"))
+        with patch.object(panel, "save_config"), patch.object(panel, "create_task", side_effect=lambda app: events.append("register")):
+            self.assertEqual(panel.ServiceCard._start(controller), "requested")
+        self.assertEqual(events, ["register", "run"])
+        controller._run.reset_mock()
+        with patch.object(panel, "create_task", side_effect=RuntimeError("Access denied")):
+            with self.assertRaisesRegex(RuntimeError, "Access denied"):
+                panel.ServiceCard._start(controller)
+        controller._run.assert_not_called()
 
     def test_hidden_runner_keeps_log_and_exit_code(self):
         with tempfile.TemporaryDirectory() as directory:

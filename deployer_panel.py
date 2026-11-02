@@ -21,7 +21,7 @@ CONFIG = ROOT / "services.json"
 LOG_DIR = ROOT / "panel_logs"
 MANAGED_BATS = ROOT / "managed_bats"
 ADDRESSES = ROOT / "direcciones.txt"
-VERSION = "v3.4"
+VERSION = "v3.5"
 LOG_DIR.mkdir(exist_ok=True)
 MANAGED_BATS.mkdir(exist_ok=True)
 
@@ -117,13 +117,6 @@ def sync_bat(app):
         app["url"] = detected["url"]
     app["script_hash"] = detected["script_hash"]
     return changed
-
-
-def task_exists(name):
-    try:
-        return run(["schtasks", "/Query", "/TN", name], timeout=4).returncode == 0
-    except subprocess.TimeoutExpired:
-        return False
 
 
 def task_state(name):
@@ -270,12 +263,19 @@ def create_task(app):
         f"-WorkingDirectory {quote(app_path(app['cwd']))};"
         "$settings=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries "
         "-ExecutionTimeLimit (New-TimeSpan -Hours 0);"
-        f"Register-ScheduledTask -TaskName {quote(task)} -Action $action -Principal $principal -Settings $settings -Force | Out-Null"
+        f"Register-ScheduledTask -TaskName {quote(task)} -Action $action -Principal $principal -Settings $settings -Force | Out-Null;"
+        f"$registered=Get-ScheduledTask -TaskName {quote(task)};"
+        "if(@($registered.Actions).Count -ne 1 -or "
+        "$registered.Actions[0].Execute -ne $action.Execute -or "
+        "$registered.Actions[0].Arguments -ne $action.Arguments -or "
+        "$registered.Actions[0].WorkingDirectory -ne $action.WorkingDirectory -or "
+        "$registered.Principal.RunLevel -ne $principal.RunLevel -or "
+        "$registered.Principal.LogonType -ne $principal.LogonType)"
+        "{throw 'Windows no guardo la tarea con el lanzador oculto y permisos elevados.'}"
     )
     r = ps(script)
     if r.returncode:
         raise RuntimeError(r.stderr or r.stdout or f"No se pudo instalar {task}")
-    app["runner_version"] = 1
 
 
 def run_task(name):
@@ -1016,10 +1016,9 @@ class ServiceCard(tk.Frame):
 
     def _start(self):
         self.app_ui.sync_service(self.app)
-        if self.app.get("runner_version") != 1 or self.app.get("task_dirty") or not task_exists(self.app["task"]):
-            create_task(self.app)
-            self.app["task_dirty"] = False
-            save_config(self.app_ui.config_data)
+        create_task(self.app)
+        self.app["task_dirty"] = False
+        save_config(self.app_ui.config_data)
         return self._run(["schtasks", "/Run", "/TN", self.app["task"]], "solicitud de inicio")
 
 
