@@ -9,6 +9,18 @@ import deployer_panel as panel
 
 
 class LaunchCheck(unittest.TestCase):
+    def test_project_local_bat_requires_its_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bat = Path(directory) / "iniciar.bat"
+            bat.write_text('@echo off\ncd /d "%~dp0"\ncall pnpm install\n', encoding="utf-8")
+            app = {"bat": str(bat), "port_mode": "auto"}
+            with self.assertRaisesRegex(FileNotFoundError, "Selecciona el BAT original"):
+                panel.sync_bat(app)
+            (bat.parent / "package.json").write_text('{}', encoding="utf-8")
+            self.assertTrue(panel.sync_bat(app))
+            bat.write_text('@echo off\ncd /d "%~dp0"\npushd "D:\\other-project"\ncall pnpm install\n', encoding="utf-8")
+            self.assertFalse(panel.inspect_bat(bat)["requires_manifest"])
+
     def test_bat_changes_refresh_detected_values_but_keep_manual_values(self):
         with tempfile.TemporaryDirectory() as directory:
             bat = Path(directory) / "start.bat"

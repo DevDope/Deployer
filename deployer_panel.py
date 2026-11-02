@@ -17,7 +17,7 @@ CONFIG = ROOT / "services.json"
 LOG_DIR = ROOT / "panel_logs"
 MANAGED_BATS = ROOT / "managed_bats"
 ADDRESSES = ROOT / "direcciones.txt"
-VERSION = "v3.1"
+VERSION = "v3.2"
 LOG_DIR.mkdir(exist_ok=True)
 MANAGED_BATS.mkdir(exist_ok=True)
 
@@ -88,11 +88,23 @@ def inspect_bat(path):
                 ports.add(number)
     url = next((variables[key] for key in ("PUBLIC_URL", "SITE_URL", "APP_URL", "SITE_ORIGIN", "PUBLIC_ORIGIN")
                 if variables.get(key, "").startswith(("https://", "http://"))), "")
-    return {"ports": sorted(ports), "url": url, "script_hash": hashlib.sha256(data).hexdigest()}
+    active = "\n".join(line for line in text.splitlines() if not re.match(r"(?i)\s*(?:@?rem\b|::)", line))
+    directories = re.findall(r"(?im)^\s*@?(?:cd|pushd)\b[^\r\n]*", active)
+    requires_manifest = (
+        len(directories) == 1
+        and bool(re.fullmatch(r'(?i)\s*@?cd\s+/d\s+"?%~dp0"?\s*', directories[0]))
+        and bool(re.search(r"(?i)\b(?:npm|pnpm)(?:\.cmd)?\s+(?:install|ci|build|run|exec)\b", active))
+    )
+    return {"ports": sorted(ports), "url": url, "script_hash": hashlib.sha256(data).hexdigest(), "requires_manifest": requires_manifest}
 
 
 def sync_bat(app):
     detected = inspect_bat(app["bat"])
+    if detected["requires_manifest"] and not (app_path(app["bat"]).parent / "package.json").is_file():
+        raise FileNotFoundError(
+            f"El BAT usa su propia carpeta, pero falta package.json en {app_path(app['bat']).parent}. "
+            "Selecciona el BAT original dentro del proyecto, no una copia dentro de Deployer."
+        )
     changed = app.get("script_hash") != detected["script_hash"]
     if app.get("port_mode", "manual") == "auto":
         app["ports"] = detected["ports"]
