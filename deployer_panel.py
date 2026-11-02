@@ -1,10 +1,15 @@
 import json
+import hashlib
 import queue
+import re
 import subprocess
 import threading
 import tkinter as tk
+import webbrowser
+from datetime import datetime
 from pathlib import Path
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
+from urllib.parse import urlsplit
 
 
 ROOT = Path(__file__).resolve().parent
@@ -12,19 +17,19 @@ CONFIG = ROOT / "services.json"
 LOG_DIR = ROOT / "panel_logs"
 MANAGED_BATS = ROOT / "managed_bats"
 ADDRESSES = ROOT / "direcciones.txt"
-VERSION = "v2.6 diagnostico"
+VERSION = "v3.1"
 LOG_DIR.mkdir(exist_ok=True)
 MANAGED_BATS.mkdir(exist_ok=True)
 
-BG = "#050807"
-PANEL = "#0c1512"
-PANEL_2 = "#08100e"
-GREEN = "#39ff88"
-CYAN = "#42d9ff"
-RED = "#ff4d6d"
-YELLOW = "#ffd166"
-TEXT = "#d8ffe8"
-MUTED = "#80a895"
+BG = "#f4f5f7"
+PANEL = "#ffffff"
+PANEL_2 = "#e9edf1"
+GREEN = "#16704b"
+CYAN = "#245fa6"
+RED = "#b93d45"
+YELLOW = "#916515"
+TEXT = "#20252c"
+MUTED = "#66717e"
 
 
 def run(args, timeout=8):
@@ -55,6 +60,46 @@ def slug(text):
 def app_path(value):
     p = Path(value)
     return p if p.is_absolute() else ROOT / p
+
+
+def inspect_bat(path):
+    data = app_path(path).read_bytes()
+    text = data.decode("utf-8-sig", errors="replace")
+    variables = {}
+    commands = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or re.match(r"(?i)@?rem\b|::", line):
+            continue
+        line = re.sub(r"%([^%]+)%", lambda m: variables.get(m[1].upper(), m[0]), line)
+        assignment = re.match(r'(?i)(?:@?set\s+|if\s+not\s+defined\s+\w+\s+set\s+)"?([\w]+)=([^\r\n]*)', line)
+        if assignment:
+            variables[assignment[1].upper()] = assignment[2].rstrip('"').strip()
+        commands.append(line)
+    # shortcut: static BAT inspection only; computed values and called scripts need manual ports.
+    ports = {int(value) for key, value in variables.items()
+             if re.search(r"(?:^|_)PORT(?:$|_)", key) and value.isdigit() and 1 <= int(value) <= 65535}
+    for command in commands:
+        if re.match(r"(?i)@?echo\b", command):
+            continue
+        for value in re.findall(r"(?i)--port(?:=|\s+)(\d+)\b|--(?:listen|bind)(?:=|\s+)[\w.\[\]:-]*:(\d+)\b", command):
+            number = int(next(part for part in value if part))
+            if 1 <= number <= 65535:
+                ports.add(number)
+    url = next((variables[key] for key in ("PUBLIC_URL", "SITE_URL", "APP_URL", "SITE_ORIGIN", "PUBLIC_ORIGIN")
+                if variables.get(key, "").startswith(("https://", "http://"))), "")
+    return {"ports": sorted(ports), "url": url, "script_hash": hashlib.sha256(data).hexdigest()}
+
+
+def sync_bat(app):
+    detected = inspect_bat(app["bat"])
+    changed = app.get("script_hash") != detected["script_hash"]
+    if app.get("port_mode", "manual") == "auto":
+        app["ports"] = detected["ports"]
+    if app.get("url_mode", "manual") == "auto":
+        app["url"] = detected["url"]
+    app["script_hash"] = detected["script_hash"]
+    return changed
 
 
 def task_exists(name):
@@ -148,6 +193,8 @@ def process_metrics(pids):
 
 
 def latest_log(path):
+    if not path:
+        return None
     p = app_path(path)
     if p.drive and not Path(p.drive + "\\").exists():
         return None
@@ -246,79 +293,213 @@ def restore_base_config():
     return config
 
 
+def service_status(snap, ports):
+    if not snap:
+        return "Sin consultar", MUTED
+    if snap.get("missing"):
+        return "Falta lanzador", RED
+    opened = sum(ok for _, ok in snap.get("statuses", []))
+    if ports and opened == len(ports):
+        return "Puertos activos", GREEN
+    if opened:
+        return "Parcial", YELLOW
+    if snap.get("state") == "RUNNING":
+        return "En ejecucion", YELLOW
+    return "Sin puertos activos", MUTED
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Deployer Panel")
         self.geometry("1260x780")
+        self.minsize(960, 640)
         self.configure(bg=BG)
         self.q = queue.Queue()
         self.config_data = load_config()
         self.cards = {}
         self.selected_log = None
+        self.selected_key = None
+        self.snapshots = {}
+        self.log_running = False
         self.auto_refresh = tk.BooleanVar(value=True)
         self.scan_running = False
         self.build()
+        for app in self.config_data["apps"]:
+            try:
+                if sync_bat(app):
+                    self.log(f"[BAT] {app['name']}: archivo revisado; puertos {app['ports'] or 'sin detectar'}.")
+            except OSError as exc:
+                self.log(f"[ERROR] {app['name']}: {exc}")
+        save_config(self.config_data)
+        self.update_detail()
         self.refresh()
         self.after(500, self.drain)
         self.after(5000, self.auto_tick)
 
     def build(self):
+        self.option_add("*Font", ("Segoe UI", 10))
+        style = ttk.Style(self)
+        style.theme_use("clam")
+        style.configure(".", background=BG, foreground=TEXT, font=("Segoe UI", 10))
+        style.configure("TButton", padding=(12, 7), background=PANEL, borderwidth=1)
+        style.map("TButton", background=[("active", PANEL_2)])
+        style.configure("Primary.TButton", background=GREEN, foreground="white")
+        style.map("Primary.TButton", background=[("active", "#10563a")])
+        style.configure("Treeview", background=PANEL, fieldbackground=PANEL, rowheight=52, borderwidth=0)
+        style.configure("Treeview.Heading", background=BG, foreground=MUTED, padding=10)
+        style.map("Treeview", background=[("selected", "#e4eef9")], foreground=[("selected", TEXT)])
+        style.configure("TNotebook", borderwidth=0)
+        style.configure("TNotebook.Tab", padding=(16, 9))
         top = tk.Frame(self, bg=BG)
-        top.pack(fill="x", padx=18, pady=14)
-        Logo(top).pack(side="left", padx=(0, 12))
+        top.pack(fill="x", padx=24, pady=(20, 12))
         title_box = tk.Frame(top, bg=BG)
         title_box.pack(side="left")
-        tk.Label(title_box, text=f"DEPLOYER // OPS CONTROL  {VERSION}", fg=GREEN, bg=BG, font=("Consolas", 16, "bold")).pack(anchor="w")
-        self.summary = tk.Label(title_box, text="escaneando sistemas...", fg=MUTED, bg=BG, font=("Consolas", 10))
+        tk.Label(title_box, text="Deployer", fg=TEXT, bg=BG, font=("Segoe UI", 23, "bold")).pack(anchor="w")
+        self.summary = tk.Label(title_box, text="Consultando sistemas...", fg=MUTED, bg=BG)
         self.summary.pack(anchor="w")
+        ttk.Button(top, text="Agregar servicio", style="Primary.TButton", command=self.add_service).pack(side="right", padx=(8, 0))
+        menu = tk.Menu(self, tearoff=False)
+        menu.add_command(label="Instalar todas las tareas", command=self.install_all)
+        menu.add_separator()
+        menu.add_command(label="Exportar diagnostico", command=lambda: self.bg(diagnostic_report, self.config_data))
+        options = ttk.Menubutton(top, text="Herramientas", menu=menu)
+        options.pack(side="right", padx=8)
+        ttk.Button(top, text="Actualizar", command=self.refresh).pack(side="right")
 
-        tk.Checkbutton(top, text="Auto", variable=self.auto_refresh, bg=BG, fg=TEXT, selectcolor=PANEL, activebackground=BG).pack(side="right", padx=6)
-        tk.Button(top, text="Instalar todo", command=self.install_all, bg=PANEL, fg=CYAN).pack(side="right", padx=6)
-        tk.Button(top, text="Diagnostico", command=lambda: self.bg(diagnostic_report, self.config_data), bg=PANEL, fg=YELLOW).pack(side="right", padx=6)
-        tk.Button(top, text="Reparar rutas", command=self.repair_paths, bg=PANEL, fg=YELLOW).pack(side="right", padx=6)
-        tk.Button(top, text="Agregar servicio", command=self.add_service, bg=PANEL, fg=CYAN).pack(side="right", padx=6)
-        tk.Button(top, text="Refrescar", command=self.refresh, bg=PANEL, fg=GREEN).pack(side="right", padx=6)
+        content = ttk.Panedwindow(self, orient="horizontal")
+        content.pack(fill="both", expand=True, padx=24, pady=(4, 12))
+        left = tk.Frame(content, bg=PANEL)
+        right = tk.Frame(content, bg=BG)
+        content.add(left, weight=2)
+        content.add(right, weight=5)
+        self.service_list = ttk.Treeview(left, columns=("state",), show="tree headings", selectmode="browse")
+        self.service_list.heading("#0", text="Sistema", anchor="w")
+        self.service_list.heading("state", text="Estado", anchor="w")
+        self.service_list.column("#0", width=195, minwidth=140)
+        self.service_list.column("state", width=145, minwidth=135, stretch=False)
+        scrollbar = ttk.Scrollbar(left, orient="vertical", command=self.service_list.yview)
+        self.service_list.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        self.service_list.pack(fill="both", expand=True)
+        self.service_list.bind("<<TreeviewSelect>>", self.select_service)
+        for tag, color in (("active", GREEN), ("error", RED), ("unknown", MUTED), ("partial", YELLOW)):
+            self.service_list.tag_configure(tag, foreground=color)
 
-        self.grid = tk.Frame(self, bg=BG)
-        self.grid.pack(fill="both", expand=True, padx=18)
+        self.detail_title = tk.Label(right, bg=BG, fg=TEXT, font=("Segoe UI", 20, "bold"), anchor="w")
+        self.detail_title.pack(fill="x", padx=(20, 0), pady=(8, 6))
+        self.detail_status = tk.Label(right, bg=BG, fg=MUTED, anchor="w")
+        self.detail_status.pack(fill="x", padx=(20, 0))
+        self.detail_paths = tk.Label(right, bg=BG, fg=MUTED, anchor="w", justify="left", wraplength=560)
+        self.detail_paths.pack(fill="x", padx=(20, 0), pady=(10, 12))
+        right.bind("<Configure>", lambda e: (self.detail_paths.configure(wraplength=max(200, e.width - 24)), self.detail_status.configure(wraplength=max(200, e.width - 24))))
+        self.actions = tk.Frame(right, bg=BG)
+        self.actions.pack(fill="x", padx=(20, 0), pady=(0, 12))
+        self.secondary = tk.Frame(right, bg=BG)
+        self.secondary.pack(fill="x", padx=(20, 0), pady=(0, 12))
+        self.notebook = ttk.Notebook(right)
+        self.notebook.pack(fill="both", expand=True, padx=(20, 0))
+        logs = tk.Frame(self.notebook, bg=PANEL)
+        events = tk.Frame(self.notebook, bg=PANEL)
+        self.notebook.add(logs, text="Logs")
+        self.notebook.add(events, text="Actividad")
+        log_top = tk.Frame(logs, bg=PANEL)
+        log_top.pack(fill="x")
+        self.log_source = tk.StringVar(value="Salida del panel")
+        source = ttk.Combobox(log_top, textvariable=self.log_source, values=("Salida del panel", "Logs de aplicacion"), state="readonly", width=22)
+        source.pack(side="left", padx=8, pady=8)
+        source.bind("<<ComboboxSelected>>", lambda e: self.select_log_source())
+        ttk.Button(log_top, text="Actualizar log", command=self.refresh_log).pack(side="right", padx=8)
+        self.log_view = self.text_area(logs)
+        self.events = self.text_area(events)
+        self.log_path = tk.Label(logs, text="", bg=PANEL, fg=MUTED, anchor="w", wraplength=550)
+        self.log_path.pack(side="bottom", before=self.log_view.master, fill="x", padx=10, pady=6)
+        footer = tk.Frame(self, bg=BG)
+        footer.pack(side="bottom", before=content, fill="x", padx=24, pady=(0, 12))
+        tk.Label(footer, text=VERSION, bg=BG, fg=MUTED).pack(side="left")
+        ttk.Checkbutton(footer, text="Actualizacion automatica", variable=self.auto_refresh).pack(side="right")
         self.render_cards()
 
-        bottom = tk.Frame(self, bg=BG)
-        bottom.pack(fill="x", padx=18, pady=(2, 14))
-        left = tk.Frame(bottom, bg=BG)
-        left.pack(side="left", fill="both", expand=True, padx=(0, 8))
-        right = tk.Frame(bottom, bg=BG)
-        right.pack(side="left", fill="both", expand=True, padx=(8, 0))
-
-        tk.Label(left, text="EVENTOS", fg=CYAN, bg=BG, font=("Consolas", 11, "bold")).pack(anchor="w")
-        self.events = tk.Text(left, height=8, bg="#020403", fg=TEXT, insertbackground=GREEN, font=("Consolas", 10))
-        self.events.pack(fill="both", expand=True)
-
-        log_top = tk.Frame(right, bg=BG)
-        log_top.pack(fill="x")
-        tk.Label(log_top, text="LOGS", fg=CYAN, bg=BG, font=("Consolas", 11, "bold")).pack(side="left")
-        tk.Button(log_top, text="Actualizar log", command=self.refresh_log, bg=PANEL, fg=GREEN).pack(side="right")
-        self.log_view = tk.Text(right, height=8, bg="#020403", fg=TEXT, insertbackground=GREEN, font=("Consolas", 10))
-        self.log_view.pack(fill="both", expand=True)
+    def text_area(self, parent):
+        frame = tk.Frame(parent, bg=PANEL)
+        frame.pack(fill="both", expand=True)
+        text = tk.Text(frame, bg=PANEL, fg=TEXT, font=("Consolas", 10), height=8, width=40, relief="flat", padx=12, pady=12, wrap="word", state="disabled")
+        scroll = ttk.Scrollbar(frame, command=text.yview)
+        text.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        text.pack(fill="both", expand=True)
+        return text
 
     def render_cards(self):
-        for child in self.grid.winfo_children():
-            child.destroy()
+        for card in self.cards.values():
+            card.destroy()
+        self.service_list.delete(*self.service_list.get_children())
         self.cards = {}
-        for i, app in enumerate(self.config_data["apps"]):
-            card = ServiceCard(self.grid, self, app)
-            card.grid(row=i // 2, column=i % 2, sticky="nsew", padx=8, pady=8)
+        for app in self.config_data["apps"]:
+            card = ServiceCard(self, self, app)
             self.cards[app["key"]] = card
-        row = (len(self.config_data["apps"]) + 1) // 2
-        self.cloud = CloudCard(self.grid, self, self.config_data.get("cloudflared_service", "cloudflared"))
-        self.cloud.grid(row=row, column=0, columnspan=2, sticky="nsew", padx=8, pady=8)
-        self.grid.columnconfigure(0, weight=1)
-        self.grid.columnconfigure(1, weight=1)
+            self.service_list.insert("", "end", iid=app["key"], text=app["name"], values=("Sin consultar",), tags=("unknown",))
+        if hasattr(self, "cloud"):
+            self.cloud.destroy()
+        self.cloud = CloudCard(self, self, self.config_data.get("cloudflared_service", "cloudflared"))
+        self.service_list.insert("", "end", iid="__cloud__", text="Cloudflared", values=("Sin consultar",), tags=("unknown",))
+        keys = self.service_list.get_children()
+        self.service_list.selection_set(self.selected_key if self.selected_key in keys else keys[0])
+        self.select_service()
+
+    def select_service(self, event=None):
+        selection = self.service_list.selection()
+        if not selection:
+            return
+        self.selected_key = selection[0]
+        for frame in (self.actions, self.secondary):
+            for child in frame.winfo_children():
+                child.destroy()
+        cloud = self.selected_key == "__cloud__"
+        controller = self.cloud if cloud else self.cards[self.selected_key]
+        self.detail_title.configure(text="Cloudflared" if cloud else controller.app["name"])
+        for i, (label, action) in enumerate((("Iniciar", "Start-Service"), ("Detener", "Stop-Service"), ("Reiniciar", "Restart-Service"))):
+            command = (lambda a=action: self.cloud.control(a)) if cloud else (controller.start, controller.stop, controller.restart)[i]
+            ttk.Button(self.actions, text=label, command=command, style="Primary.TButton" if i == 0 else "TButton").pack(side="left", padx=(0, 8))
+        if cloud:
+            ttk.Button(self.secondary, text="Configurar servicio", command=self.configure_cloud).pack(side="left")
+            self.selected_log = None
+            self.set_log("Cloudflared se controla mediante el servicio de Windows.")
+        else:
+            if controller.app.get("url"):
+                ttk.Button(self.actions, text="Abrir URL", command=lambda: webbrowser.open(controller.app["url"])).pack(side="left")
+            for label, command in (("Abrir CMD", controller.open_cmd), ("Instalar tarea", controller.install), ("Editar", lambda: self.edit_service(controller.app)), ("Quitar", lambda: self.delete_service(controller.app))):
+                ttk.Button(self.secondary, text=label, command=command).pack(side="left", padx=(0, 6))
+            self.select_log_source()
+        self.update_detail()
+
+    def update_detail(self):
+        if self.selected_key == "__cloud__":
+            self.detail_status.configure(text=getattr(self.cloud, "state", "Sin consultar"), fg=MUTED)
+            self.detail_paths.configure(text=f"Servicio de Windows: {self.cloud.service}")
+        elif self.selected_key in self.cards:
+            app = self.cards[self.selected_key].app
+            snap = self.snapshots.get(self.selected_key, {})
+            status, color = service_status(snap, app.get("ports", []))
+            self.detail_status.configure(text=f"{status}   |   {snap.get('metrics', 'CPU -- | RAM --')}   |   Tarea: {snap.get('state', 'Sin consultar')}", fg=color)
+            ports = "   ".join(f"{p}: {'activo' if ok else 'cerrado'}" for p, ok in snap.get("statuses", [])) or ("Puertos sin consultar" if app.get("ports") else "Puerto no detectado")
+            self.detail_paths.configure(text=f"{ports}\nURL: {app.get('url') or 'Sin configurar'}\n\nBAT: {app_path(app['bat'])}\nCarpeta: {app_path(app['cwd'])}")
+
+    def configure_cloud(self):
+        from tkinter.simpledialog import askstring
+        name = askstring("Cloudflared", "Nombre del servicio de Windows", initialvalue=self.cloud.service, parent=self)
+        if name and name.strip():
+            self.config_data["cloudflared_service"] = name.strip()
+            save_config(self.config_data)
+            self.cloud.service = name.strip()
+            self.update_detail()
+            self.refresh()
 
     def log(self, msg):
-        self.events.insert("end", msg + "\n")
+        self.events.configure(state="normal")
+        self.events.insert("end", datetime.now().strftime("%H:%M:%S  ") + msg + "\n")
         self.events.see("end")
+        self.events.configure(state="disabled")
 
     def bg(self, fn, *args):
         def work():
@@ -333,6 +514,22 @@ class App(tk.Tk):
             msg = self.q.get()
             if isinstance(msg, tuple) and msg[0] == "scan":
                 self.apply_scan(msg[1])
+                continue
+            if isinstance(msg, tuple) and msg[0] == "config":
+                self.config_data = msg[1]
+                self.render_cards()
+                self.refresh()
+                continue
+            if isinstance(msg, tuple) and msg[0] == "metadata":
+                self.update_detail()
+                continue
+            if isinstance(msg, tuple) and msg[0] == "log":
+                self.log_running = False
+                if msg[1] == self.selected_log:
+                    self.log_path.configure(text=str(msg[2] or "No hay archivo de log"))
+                    self.set_log(msg[3])
+                else:
+                    self.refresh_log()
                 continue
             if msg:
                 self.log(msg)
@@ -367,7 +564,7 @@ class App(tk.Tk):
                     "metrics": process_metrics(pids),
                     "missing": not app_path(app["bat"]).exists(),
                 }
-            service = self.config_data.get("cloudflared_service", "cloudflared")
+            service = self.config_data.get("cloudflared_service", "cloudflared").replace("'", "''")
             try:
                 cloud = ps(f"Get-Service -Name '{service}' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Status", timeout=4).stdout.strip()
             except subprocess.TimeoutExpired:
@@ -378,6 +575,7 @@ class App(tk.Tk):
             self.q.put(f"[ERROR] Escaneo fallo: {exc}")
 
     def apply_scan(self, scan):
+        self.snapshots = scan["apps"]
         active = ports_ok = total_ports = missing = 0
         for key, card in self.cards.items():
             state = card.apply_snapshot(scan["apps"].get(key, {}))
@@ -386,27 +584,53 @@ class App(tk.Tk):
             ports_ok += state["ports_ok"]
             total_ports += state["ports_total"]
         self.cloud.apply_status(scan["cloud"])
-        self.summary.configure(text=f"{active}/{len(self.cards)} activos  |  {ports_ok}/{total_ports} puertos OK  |  {missing} BAT faltantes")
+        self.summary.configure(text=f"{active}/{len(self.cards)} activos  |  {ports_ok}/{total_ports} puertos OK  |  {missing} BAT faltantes" if self.cards else "Sin sistemas registrados")
         self.scan_running = False
+        self.update_detail()
 
     def refresh_log(self):
-        if not self.selected_log:
+        if not self.selected_log or self.log_running:
             return
-        log, text = read_tail(self.selected_log)
+        self.log_running = True
+        paths = list(self.selected_log)
+        def work():
+            try:
+                log, text = read_tail(paths)
+            except Exception as exc:
+                log, text = None, f"No se pudo leer el log: {exc}"
+            self.q.put(("log", paths, log, text))
+        threading.Thread(target=work, daemon=True).start()
+
+    def set_log(self, text):
+        self.log_view.configure(state="normal")
         self.log_view.delete("1.0", "end")
-        self.log_view.insert("end", f"{log or self.selected_log}\n" + "-" * 70 + "\n" + text)
+        self.log_view.insert("end", text)
         self.log_view.see("end")
+        self.log_view.configure(state="disabled")
+
+    def select_log_source(self):
+        if self.selected_key not in self.cards:
+            return
+        app = self.cards[self.selected_key].app
+        self.selected_log = [LOG_DIR / f"{app['task']}.log"] if self.log_source.get() == "Salida del panel" else [app.get("logs", "")]
+        self.log_path.configure(text="Consultando log...")
+        self.set_log("")
+        self.refresh_log()
 
     def show_logs(self, app):
-        self.selected_log = [LOG_DIR / f"{app['task']}.log", app.get("logs", "")]
-        self.refresh_log()
+        self.service_list.selection_set(app["key"])
+        self.select_service()
+        self.notebook.select(0)
 
     def install_all(self):
         def work():
             for app in self.config_data["apps"]:
                 if not app_path(app["bat"]).exists():
                     return f"[ERROR] No existe: {app['bat']}"
+                self.sync_service(app)
                 create_task(app)
+                app["task_dirty"] = False
+            save_config(self.config_data)
             return "[OK] Tareas programadas instaladas/actualizadas."
         self.bg(work)
 
@@ -421,9 +645,7 @@ class App(tk.Tk):
             if not app_path(app["bat"]).exists():
                 return f"[ERROR] No existe wrapper: {app['bat']}"
             create_task(app)
-        self.config_data = config
-        self.after(0, self.render_cards)
-        self.after(0, self.refresh)
+        self.q.put(("config", config))
         return "[OK] Rutas reparadas y tareas reinstaladas. Ya puedes presionar Iniciar."
 
     def install_one(self, app):
@@ -432,8 +654,18 @@ class App(tk.Tk):
     def _install_one(self, app):
         if not app_path(app["bat"]).exists():
             return f"[ERROR] No existe: {app['bat']}"
+        self.sync_service(app)
         create_task(app)
+        app["task_dirty"] = False
+        save_config(self.config_data)
         return f"[OK] Tarea instalada: {app['task']}"
+
+    def sync_service(self, app):
+        changed = sync_bat(app)
+        save_config(self.config_data)
+        self.q.put(("metadata", app["key"]))
+        if changed:
+            self.q.put(f"[BAT] {app['name']}: cambio detectado; puertos {app['ports'] or 'sin detectar'}.")
 
     def add_service(self):
         ServiceDialog(self)
@@ -443,12 +675,15 @@ class App(tk.Tk):
 
     def save_service(self, app, old_key=None):
         if old_key:
+            old = next(x for x in self.config_data["apps"] if x["key"] == old_key)
+            app["task_dirty"] = old.get("task_dirty", False) or (old["bat"], old["cwd"]) != (app["bat"], app["cwd"])
             self.config_data["apps"] = [app if x["key"] == old_key else x for x in self.config_data["apps"]]
             action = "editado"
         else:
             self.config_data["apps"].append(app)
             action = "agregado"
         save_config(self.config_data)
+        self.selected_key = app["key"]
         self.render_cards()
         self.refresh()
         self.log(f"[OK] Servicio {action}: {app['name']}")
@@ -463,54 +698,67 @@ class App(tk.Tk):
         self.log(f"[OK] Servicio eliminado del panel: {app['name']}")
 
 
-class Logo(tk.Canvas):
-    def __init__(self, parent):
-        super().__init__(parent, width=72, height=72, bg=BG, highlightthickness=0)
-        self.create_oval(5, 5, 67, 67, outline=GREEN, width=2)
-        self.create_oval(14, 14, 58, 58, outline=CYAN, width=1)
-        self.create_line(36, 10, 36, 62, fill=GREEN, width=2)
-        self.create_line(10, 36, 62, 36, fill=CYAN, width=2)
-        self.create_polygon(36, 18, 49, 49, 36, 42, 23, 49, fill="", outline=GREEN, width=2)
-        self.create_text(36, 36, text="D", fill=TEXT, font=("Consolas", 20, "bold"))
-
-
 class ServiceDialog(tk.Toplevel):
     def __init__(self, app_ui, app=None):
         super().__init__(app_ui)
+        self.transient(app_ui)
         self.app_ui = app_ui
         self.old_key = app["key"] if app else None
         self.title("Editar servicio" if app else "Agregar servicio")
         self.configure(bg=BG)
         self.resizable(False, False)
         self.fields = {}
-        rows = [("Nombre", "name"), ("BAT", "bat"), ("Carpeta", "cwd"), ("Puertos", "ports"), ("Logs", "logs")]
+        self.auto_ports = tk.BooleanVar(value=app.get("port_mode", "manual") == "auto" if app else True)
+        rows = [("Nombre", "name"), ("Archivo BAT", "bat"), ("URL publica", "url"), ("Puertos", "ports"), ("Carpeta", "cwd"), ("Logs", "logs")]
         for i, (label, key) in enumerate(rows):
-            tk.Label(self, text=label, fg=TEXT, bg=BG, font=("Consolas", 10)).grid(row=i, column=0, sticky="w", padx=12, pady=6)
-            entry = tk.Entry(self, width=64, bg=PANEL, fg=TEXT, insertbackground=GREEN)
+            tk.Label(self, text=label, fg=TEXT, bg=BG).grid(row=i, column=0, sticky="w", padx=12, pady=6)
+            entry = ttk.Entry(self, width=60)
             entry.grid(row=i, column=1, padx=8, pady=6)
             self.fields[key] = entry
             if key in ("bat", "cwd", "logs"):
-                tk.Button(self, text="...", command=lambda k=key: self.pick(k), bg=PANEL, fg=CYAN, width=4).grid(row=i, column=2, padx=8)
+                ttk.Button(self, text="Buscar", command=lambda k=key: self.pick(k)).grid(row=i, column=2, padx=8)
+            if key == "ports":
+                ttk.Button(self, text="Detectar", command=self.detect).grid(row=i, column=2, padx=8)
         if app:
             self.fields["name"].insert(0, app["name"])
             self.fields["bat"].insert(0, app["bat"])
             self.fields["cwd"].insert(0, app["cwd"])
             self.fields["ports"].insert(0, ",".join(str(p) for p in app.get("ports", [])))
+            self.fields["url"].insert(0, app.get("url", ""))
             self.fields["logs"].insert(0, app.get("logs", ""))
-        else:
-            self.fields["ports"].insert(0, "7000")
-        help_text = (
-            "BAT: archivo .bat que se ejecuta. Carpeta: carpeta donde debe correr. "
-            "Logs: carpeta o archivo .log opcional; si no existe se usa panel_logs. Puertos: separados por coma."
-        )
-        tk.Label(self, text=help_text, fg=MUTED, bg=BG, font=("Consolas", 9), wraplength=560, justify="left").grid(
-            row=len(rows), column=0, columnspan=3, sticky="w", padx=12, pady=(4, 0)
-        )
+        self.fields["bat"].bind("<FocusOut>", lambda e: self.detect())
+        ttk.Checkbutton(self, text="Actualizar puertos desde el BAT en cada arranque", variable=self.auto_ports, command=self.toggle_ports).grid(row=len(rows), column=1, sticky="w", padx=8, pady=8)
+        self.detection = tk.Label(self, text="", fg=MUTED, bg=BG, wraplength=450, justify="left")
+        self.detection.grid(row=len(rows) + 1, column=1, sticky="w", padx=8)
         buttons = tk.Frame(self, bg=BG)
-        buttons.grid(row=len(rows) + 1, column=0, columnspan=3, sticky="e", padx=12, pady=12)
-        tk.Button(buttons, text="Cancelar", command=self.destroy, bg=PANEL, fg=TEXT, width=12).pack(side="right", padx=4)
-        tk.Button(buttons, text="Guardar", command=self.save, bg=PANEL, fg=GREEN, width=12).pack(side="right", padx=4)
+        buttons.grid(row=len(rows) + 2, column=0, columnspan=3, sticky="e", padx=12, pady=12)
+        ttk.Button(buttons, text="Guardar", command=self.save, style="Primary.TButton").pack(side="right", padx=4)
+        ttk.Button(buttons, text="Cancelar", command=self.destroy).pack(side="right", padx=4)
+        self.toggle_ports()
         self.grab_set()
+
+    def toggle_ports(self):
+        self.fields["ports"].configure(state="readonly" if self.auto_ports.get() else "normal")
+        if self.auto_ports.get():
+            self.detect()
+
+    def detect(self):
+        bat = self.fields["bat"].get().strip()
+        if not bat:
+            return
+        try:
+            found = inspect_bat(bat)
+        except OSError as exc:
+            self.detection.configure(text=str(exc), fg=RED)
+            return
+        if self.auto_ports.get():
+            self.fields["ports"].configure(state="normal")
+            self.fields["ports"].delete(0, "end")
+            self.fields["ports"].insert(0, ",".join(map(str, found["ports"])))
+            self.fields["ports"].configure(state="readonly")
+        if not self.fields["url"].get() and found["url"]:
+            self.fields["url"].insert(0, found["url"])
+        self.detection.configure(text="Puertos detectados: " + ", ".join(map(str, found["ports"])) if found["ports"] else "Puerto no detectable. Desactiva la actualizacion automatica e indicalo manualmente.", fg=MUTED)
 
     def pick(self, key):
         if key == "bat":
@@ -520,6 +768,7 @@ class ServiceDialog(tk.Toplevel):
                 self.fields["bat"].insert(0, value)
                 self.fields["cwd"].delete(0, "end")
                 self.fields["cwd"].insert(0, str(Path(value).parent))
+                self.detect()
             return
         value = filedialog.askdirectory()
         if value:
@@ -527,79 +776,75 @@ class ServiceDialog(tk.Toplevel):
             self.fields[key].insert(0, value)
 
     def save(self):
+        self.detect()
         name = self.fields["name"].get().strip()
         bat = self.fields["bat"].get().strip()
         cwd = self.fields["cwd"].get().strip() or str(Path(bat).parent)
         logs = self.fields["logs"].get().strip() or cwd
+        url = self.fields["url"].get().strip()
+        try:
+            parsed = urlsplit(url)
+            if parsed.scheme not in ("http", "https") or not parsed.hostname or any(c.isspace() for c in url):
+                raise ValueError
+            parsed.port
+        except ValueError:
+            messagebox.showerror("URL invalida", "Indica una URL completa, por ejemplo https://mi-sistema.com")
+            return
         try:
             ports = [int(x.strip()) for x in self.fields["ports"].get().split(",") if x.strip()]
+            if not ports or any(not 1 <= port <= 65535 for port in ports):
+                raise ValueError
         except ValueError:
             messagebox.showerror("Puertos invalidos", "Usa formato: 7000,7001")
             return
         if not name or not bat:
             messagebox.showerror("Faltan datos", "Nombre y BAT son obligatorios.")
             return
-        if not app_path(bat).exists():
+        if not app_path(bat).is_file() or app_path(bat).suffix.lower() != ".bat":
             messagebox.showerror("BAT no existe", str(app_path(bat)))
             return
-        if not app_path(cwd).exists():
+        if not app_path(cwd).is_dir():
             messagebox.showerror("Carpeta no existe", str(app_path(cwd)))
             return
         app = {
-            "key": slug(name).lower(),
+            "key": self.old_key or slug(name).lower(),
             "name": name,
-            "task": f"Deployer_{slug(name)}",
+            "task": next((x["task"] for x in self.app_ui.config_data["apps"] if x["key"] == self.old_key), f"Deployer_{slug(name)}"),
             "cwd": cwd,
             "bat": bat,
             "ports": ports,
+            "url": url,
+            "port_mode": "auto" if self.auto_ports.get() else "manual",
             "logs": logs,
         }
+        if not self.old_key and any(x["key"] == app["key"] for x in self.app_ui.config_data["apps"]):
+            messagebox.showerror("Servicio existente", "Ya existe un servicio con ese nombre.")
+            return
+        try:
+            app["url_mode"] = "auto" if inspect_bat(bat)["url"] == url else "manual"
+            sync_bat(app)
+        except OSError as exc:
+            messagebox.showerror("No se pudo leer el BAT", str(exc))
+            return
         self.app_ui.save_service(app, self.old_key)
         self.destroy()
 
 
 class ServiceCard(tk.Frame):
     def __init__(self, parent, app_ui, app):
-        super().__init__(parent, bg=PANEL, bd=1, relief="solid")
+        super().__init__(parent)
         self.app_ui = app_ui
         self.app = app
-        self.bar = tk.Frame(self, bg=RED, width=7)
-        self.bar.pack(side="left", fill="y")
-        body = tk.Frame(self, bg=PANEL)
-        body.pack(side="left", fill="both", expand=True)
-        header = tk.Frame(body, bg=PANEL)
-        header.pack(fill="x", padx=12, pady=(10, 4))
-        self.title = tk.Label(header, text=app["name"], fg=GREEN, bg=PANEL, font=("Consolas", 15, "bold"))
-        self.title.pack(side="left")
-        tk.Button(header, text="Editar", command=lambda: app_ui.edit_service(app), bg=PANEL_2, fg=CYAN, width=8).pack(side="right", padx=2)
-        tk.Button(header, text="Quitar", command=lambda: app_ui.delete_service(app), bg=PANEL_2, fg=RED, width=8).pack(side="right", padx=2)
-        self.status = tk.Label(body, fg=TEXT, bg=PANEL, font=("Consolas", 10), justify="left")
-        self.status.pack(anchor="w", padx=12)
-        self.ports = tk.Frame(body, bg=PANEL)
-        self.ports.pack(anchor="w", padx=12, pady=4)
-        buttons = tk.Frame(body, bg=PANEL)
-        buttons.pack(anchor="w", padx=10, pady=10)
-        for label, cmd in [
-            ("Instalar", self.install), ("Iniciar", self.start), ("Detener", self.stop),
-            ("Reiniciar", self.restart), ("Abrir CMD", self.open_cmd), ("Ver logs", self.open_logs),
-        ]:
-            tk.Button(buttons, text=label, command=cmd, bg=BG, fg=CYAN, width=10).pack(side="left", padx=3)
 
     def apply_snapshot(self, snap):
-        state = snap.get("state", "ESCANEANDO")
         statuses = snap.get("statuses", [])
-        pids = snap.get("pids", [])
-        active = bool(pids) or "RUNNING" in state
+        opened = sum(ok for _, ok in statuses)
+        active = bool(statuses) and opened == len(statuses)
         missing = snap.get("missing", False)
-        color = YELLOW if not snap else RED if missing else GREEN if active else YELLOW if "READY" in state else RED
-        self.bar.configure(bg=color)
-        self.title.configure(fg=color)
-        self.status.configure(text=f"Tarea: {state}  |  {snap.get('metrics', 'CPU -- | RAM --')}\nLanzador: {'OK' if not missing else 'FALTA'}")
-        for child in self.ports.winfo_children():
-            child.destroy()
-        for port, ok in statuses:
-            tk.Label(self.ports, text=f" {port} {'OK' if ok else '--'} ", fg=BG, bg=GREEN if ok else RED, font=("Consolas", 9, "bold")).pack(side="left", padx=3)
-        return {"active": active, "missing": missing, "ports_ok": sum(1 for _, ok in statuses if ok), "ports_total": len(statuses)}
+        status, color = service_status(snap, self.app.get("ports", []))
+        tag = {GREEN: "active", RED: "error", YELLOW: "partial"}.get(color, "unknown")
+        self.app_ui.service_list.item(self.app["key"], values=(status,), tags=(tag,))
+        return {"active": active, "missing": missing, "ports_ok": opened, "ports_total": len(self.app.get("ports", []))}
 
     def install(self):
         self.app_ui.install_one(self.app)
@@ -615,17 +860,20 @@ class ServiceCard(tk.Frame):
         if not messagebox.askyesno("Reiniciar", f"Reiniciar {self.app['name']}?"):
             return
         def work():
-            if not task_exists(self.app["task"]):
-                create_task(self.app)
+            self.app_ui.sync_service(self.app)
             self._run(["schtasks", "/End", "/TN", self.app["task"]], "detenido")
-            self._run(["schtasks", "/Run", "/TN", self.app["task"]], "iniciado")
-            return f"[OK] {self.app['name']} reiniciado."
+            return self._start()
         self.app_ui.bg(work)
 
     def open_cmd(self):
         bat = app_path(self.app["bat"])
         if not bat.exists():
             messagebox.showerror("No existe", str(bat))
+            return
+        try:
+            self.app_ui.sync_service(self.app)
+        except OSError as exc:
+            messagebox.showerror("No se pudo leer el BAT", str(exc))
             return
         subprocess.Popen(["cmd", "/k", f'cd /d "{app_path(self.app["cwd"])}" && call "{bat}"'], creationflags=subprocess.CREATE_NEW_CONSOLE)
         self.app_ui.log(f"[CMD] {self.app['name']} abierto en consola.")
@@ -639,32 +887,30 @@ class ServiceCard(tk.Frame):
         return f"[{'OK' if r.returncode == 0 else 'ERROR'}] {self.app['name']} {action}. {msg}"
 
     def _start(self):
-        if not task_exists(self.app["task"]):
+        self.app_ui.sync_service(self.app)
+        if self.app.get("task_dirty") or not task_exists(self.app["task"]):
             create_task(self.app)
-        return self._run(["schtasks", "/Run", "/TN", self.app["task"]], "iniciado")
+            self.app["task_dirty"] = False
+            save_config(self.app_ui.config_data)
+        return self._run(["schtasks", "/Run", "/TN", self.app["task"]], "solicitud de inicio")
 
 
 class CloudCard(tk.Frame):
     def __init__(self, parent, app_ui, service):
-        super().__init__(parent, bg=PANEL, bd=1, relief="solid")
+        super().__init__(parent)
         self.app_ui = app_ui
         self.service = service
-        tk.Label(self, text="Cloudflared", fg=CYAN, bg=PANEL, font=("Consolas", 15, "bold")).pack(anchor="w", padx=12, pady=(10, 4))
-        self.status = tk.Label(self, fg=TEXT, bg=PANEL, font=("Consolas", 10))
-        self.status.pack(anchor="w", padx=12)
-        buttons = tk.Frame(self, bg=PANEL)
-        buttons.pack(anchor="w", padx=10, pady=10)
-        for label, action in [("Iniciar", "Start-Service"), ("Detener", "Stop-Service"), ("Reiniciar", "Restart-Service")]:
-            tk.Button(buttons, text=label, command=lambda a=action: self.control(a), bg=BG, fg=CYAN, width=11).pack(side="left", padx=3)
 
     def apply_status(self, status):
-        self.status.configure(text=f"Servicio: {self.service} | Estado: {status or 'NO ENCONTRADO'}")
+        self.state = {"Running": "Activo", "Stopped": "Detenido"}.get(status, status or "No encontrado")
+        self.app_ui.service_list.item("__cloud__", values=(self.state,), tags=("active" if status == "Running" else "unknown",))
 
     def control(self, action):
         self.app_ui.bg(lambda: self._control(action))
 
     def _control(self, action):
-        r = ps(f"{action} -Name '{self.service}' -ErrorAction Stop")
+        service = self.service.replace("'", "''")
+        r = ps(f"{action} -Name '{service}' -ErrorAction Stop")
         return f"[{'OK' if r.returncode == 0 else 'ERROR'}] Cloudflared: {action}. {(r.stderr or r.stdout).strip()}"
 
 

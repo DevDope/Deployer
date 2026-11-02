@@ -9,6 +9,81 @@ import deployer_panel as panel
 
 
 class LaunchCheck(unittest.TestCase):
+    def test_bat_changes_refresh_detected_values_but_keep_manual_values(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bat = Path(directory) / "start.bat"
+            bat.write_text('rem --port 9999\nset "FRONTEND_PORT=7004"\nset "PUBLIC_URL=https://demo.example"\nset "WORKSTATION_URL=http://192.168.0.103:9090"\ncall npm run preview -- --port %FRONTEND_PORT%\n', encoding="utf-8")
+            app = {"bat": str(bat), "port_mode": "auto", "url_mode": "auto"}
+            self.assertTrue(panel.sync_bat(app))
+            self.assertEqual(app["ports"], [7004])
+            self.assertEqual(app["url"], "https://demo.example")
+            self.assertFalse(panel.sync_bat(app))
+            bat.write_text('python -m waitress --listen=127.0.0.1:8015 app:wsgi\n', encoding="utf-8")
+            self.assertTrue(panel.sync_bat(app))
+            self.assertEqual(app["ports"], [8015])
+            self.assertEqual(app["url"], "")
+            app.update(port_mode="manual", url_mode="manual", ports=[8888], url="https://custom.example")
+            bat.write_text('node app --port 9000\n', encoding="utf-8")
+            panel.sync_bat(app)
+            self.assertEqual(app["ports"], [8888])
+            self.assertEqual(app["url"], "https://custom.example")
+
+    def test_add_service_and_recheck_before_launch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bat = Path(directory) / "start.bat"
+            bat.write_text('set "PORT=7004"\nset "PUBLIC_URL=https://demo.example"\n', encoding="utf-8")
+            config = {"cloudflared_service": "cloudflared", "apps": []}
+            with patch.object(panel, "load_config", return_value=config), patch.object(panel, "save_config"), patch.object(panel.App, "refresh"), patch.object(panel.App, "refresh_log"), patch.object(panel.App, "after"):
+                ui = panel.App()
+                try:
+                    self.assertEqual(list(ui.cards), [])
+                    dialog = panel.ServiceDialog(ui)
+                    dialog.fields["name"].insert(0, "Demo")
+                    with patch.object(panel.filedialog, "askopenfilename", return_value=str(bat)):
+                        dialog.pick("bat")
+                    self.assertEqual(dialog.fields["ports"].get(), "7004")
+                    self.assertEqual(dialog.fields["url"].get(), "https://demo.example")
+                    dialog.save()
+                    self.assertEqual(config["apps"][0]["cwd"], str(bat.parent))
+                    self.assertEqual(config["apps"][0]["port_mode"], "auto")
+                    bat.write_text('set "PORT=7010"\nset "PUBLIC_URL=https://new.example"\n', encoding="utf-8")
+                    card = ui.cards["demo"]
+                    with patch.object(panel, "task_exists", return_value=True), patch.object(card, "_run", return_value="requested"):
+                        self.assertEqual(card._start(), "requested")
+                    self.assertEqual(card.app["ports"], [7010])
+                    self.assertEqual(card.app["url"], "https://new.example")
+                    bat.write_text('set "PORT=7020"\n', encoding="utf-8")
+                    reopened = panel.App()
+                    try:
+                        self.assertEqual(reopened.config_data["apps"][0]["ports"], [7020])
+                    finally:
+                        reopened.destroy()
+                finally:
+                    ui.destroy()
+
+    def test_running_task_is_not_reported_as_ready_without_ports(self):
+        self.assertEqual(panel.service_status({"state": "RUNNING", "statuses": [(7004, False)]}, [7004])[0], "En ejecucion")
+        self.assertEqual(panel.service_status({"state": "RUNNING", "statuses": [(7004, True)]}, [7004])[0], "Puertos activos")
+
+    def test_desktop_controls_and_cloud_selection(self):
+        with patch.object(panel.App, "refresh"), patch.object(panel.App, "refresh_log"):
+            ui = panel.App()
+            try:
+                for size in ("1260x780", "960x640"):
+                    ui.geometry(size)
+                    ui.update()
+                    for frame in (ui.actions, ui.secondary):
+                        for button in frame.winfo_children():
+                            self.assertGreater(button.winfo_width(), 30)
+                            self.assertLessEqual(button.winfo_rootx() + button.winfo_width(), ui.winfo_rootx() + ui.winfo_width())
+                ui.service_list.selection_set("__cloud__")
+                ui.select_service()
+                self.assertEqual(ui.detail_title.cget("text"), "Cloudflared")
+                self.assertEqual(len(ui.actions.winfo_children()), 3)
+                self.assertEqual(len(ui.service_list.get_children()), len(ui.config_data["apps"]) + 1)
+            finally:
+                ui.destroy()
+
     def test_live_listener_is_detected(self):
         with socket.socket() as server:
             server.bind(("127.0.0.1", 0))
