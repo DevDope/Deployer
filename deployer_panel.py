@@ -23,7 +23,7 @@ CONFIG = ROOT / "services.json"
 LOG_DIR = ROOT / "panel_logs"
 MANAGED_BATS = ROOT / "managed_bats"
 ADDRESSES = ROOT / "direcciones.txt"
-VERSION = "v3.7"
+VERSION = "v3.8"
 LOG_DIR.mkdir(exist_ok=True)
 MANAGED_BATS.mkdir(exist_ok=True)
 
@@ -169,7 +169,8 @@ def inspect_bat(path):
     for source, content in sorted(sources.items()):
         digest.update(str(source).encode("utf-8"))
         digest.update(b"\0" + content + b"\0")
-    return {"ports": sorted(ports), "url": url, "script_hash": digest.hexdigest(), "requires_manifest": requires_manifest}
+    cooperative_stop = any(b"DEPLOYER_STOP_FILE" in content for content in sources.values())
+    return {"ports": sorted(ports), "url": url, "script_hash": digest.hexdigest(), "requires_manifest": requires_manifest, "cooperative_stop": cooperative_stop}
 
 
 def sync_bat(app):
@@ -185,6 +186,7 @@ def sync_bat(app):
     if app.get("url_mode", "manual") == "auto":
         app["url"] = detected["url"]
     app["script_hash"] = detected["script_hash"]
+    app["cooperative_stop"] = detected["cooperative_stop"]
     return changed
 
 
@@ -354,6 +356,9 @@ def run_task(name):
             sync_bat(app)
             environment = os.environ.copy()
             environment["DEPLOYER_MANAGED"] = "1"
+            stop_file = LOG_DIR / f"{name}.stop"
+            stop_file.unlink(missing_ok=True)
+            environment["DEPLOYER_STOP_FILE"] = str(stop_file)
             if app.get("inference_key_protected"):
                 environment["INFERENCE_API_KEY"] = crypt_secret(base64.b64decode(app["inference_key_protected"]), decrypt=True).decode("utf-8")
             log.write(f"\n[{datetime.now():%Y-%m-%d %H:%M:%S}] Inicio: {app_path(app['bat'])}\n")
@@ -1070,14 +1075,33 @@ class ServiceCard(tk.Frame):
 
     def stop(self):
         if messagebox.askyesno("Detener", f"Detener {self.app['name']}?"):
-            self.app_ui.bg(lambda: self._run(["schtasks", "/End", "/TN", self.app["task"]], "detenido"))
+            self.app_ui.bg(self._stop)
+
+    def _stop(self):
+        if self.app.get("cooperative_stop") and task_state(self.app["task"]) == "RUNNING":
+            (LOG_DIR / f"{self.app['task']}.stop").touch()
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                state = task_state(self.app["task"])
+                if state in ("READY", "DISABLED"):
+                    name = self.app["task"].replace("'", "''")
+                    result = ps(f"(Get-ScheduledTaskInfo -TaskName '{name}' -ErrorAction Stop).LastTaskResult")
+                    if result.returncode or result.stdout.strip() != "0":
+                        return f"[ERROR] {self.app['name']} termino con un error. Revisa su log antes de reiniciar."
+                    return f"[OK] {self.app['name']} detenido; los procesos compartidos permanecen activos."
+                time.sleep(0.5)
+            return f"[ERROR] {self.app['name']} no confirmo el cierre. No se inicio otra instancia. Revisa su log."
+        return self._run(["schtasks", "/End", "/TN", self.app["task"]], "detenido")
 
     def restart(self):
         if not messagebox.askyesno("Reiniciar", f"Reiniciar {self.app['name']}?"):
             return
         def work():
             self.app_ui.sync_service(self.app)
-            self._run(["schtasks", "/End", "/TN", self.app["task"]], "detenido")
+            if task_state(self.app["task"]) == "RUNNING":
+                result = self._stop()
+                if result.startswith("[ERROR]"):
+                    return result
             return self._start()
         self.app_ui.bg(work)
 
