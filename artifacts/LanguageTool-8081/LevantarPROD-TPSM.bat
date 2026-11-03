@@ -1,0 +1,22 @@
+@echo off
+setlocal DisableDelayedExpansion
+set "PROD_DIR=D:\TSPM\Sistema\SUIT_prod\SUIT_prod"
+set "TUNNEL_DIR=D:\TSPM\Sistema\SUIT_tunnel\SUIT_tunnel"
+set "PROD_PYTHON=%PROD_DIR%\venv\Scripts\python.exe"
+set "PROD_WAITRESS=%PROD_DIR%\venv\Scripts\waitress-serve.exe"
+set "XAMPP_APACHE=C:\xampp\apache"
+set "LT_DIR=C:\LanguageTool-6.6"
+set "PROD_PORT=7003"
+set "TUNNEL_PORT=8015"
+set "APACHE_PORT=8105"
+set "LT_PORT=8081"
+set "LANGUAGETOOL_URL=http://127.0.0.1:%LT_PORT%/v2/check"
+set "PUBLIC_URL=https://tpsm.grupo-asicce.com"
+set "SITE_ORIGIN=%PUBLIC_URL%"
+set "PDF_RENDER_ORIGIN=http://127.0.0.1:%APACHE_PORT%"
+set "WORKSTATION_URL=http://192.168.0.107:9090/infer"
+set "PYTHONUTF8=1"
+set "PYTHONIOENCODING=utf-8"
+set "TPSM_LOG_DIR=%~dp0logs\TPSM"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0Start-TPSM-Managed.ps1"
+exit /b %ERRORLEVEL%

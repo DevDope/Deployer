@@ -13,7 +13,7 @@ class TpsmLauncherCheck(unittest.TestCase):
     def test_detects_all_ports_and_cooperative_stop(self):
         launcher = Path(__file__).with_name("launchers") / "LevantarPROD-TPSM.bat"
         detected = panel.inspect_bat(launcher)
-        self.assertEqual(detected["ports"], [85, 7003, 8015, 8105])
+        self.assertEqual(detected["ports"], [7003, 8015, 8081, 8105])
         self.assertEqual(detected["url"], "https://tpsm.grupo-asicce.com")
         self.assertTrue(detected["cooperative_stop"])
 
@@ -31,7 +31,8 @@ class TpsmLauncherCheck(unittest.TestCase):
             env = os.environ.copy()
             env.update(PROD_DIR=str(root), TUNNEL_DIR=str(root), XAMPP_APACHE=str(root), LT_DIR=str(root),
                        PROD_PYTHON=sys.executable, PROD_WAITRESS=sys.executable,
-                       PROD_PORT="7003", TUNNEL_PORT="8015", APACHE_PORT="8105", LT_PORT="85",
+                       PROD_PORT="7003", TUNNEL_PORT="8015", APACHE_PORT="8105", LT_PORT="8081",
+                       LANGUAGETOOL_URL="http://127.0.0.1:8081/v2/check",
                        WORKSTATION_URL="http://127.0.0.1:9090/infer", SITE_ORIGIN="https://tpsm.grupo-asicce.com",
                        TPSM_LOG_DIR=str(root / "logs"), DEPLOYER_STOP_FILE=str(stop))
             driver = root / "test.ps1"
@@ -41,13 +42,14 @@ $global:closed = @()
 $global:ltClosed = 0
 function Get-NetTCPConnection {
     param($State, $LocalPort, $ErrorAction)
-    if ($LocalPort -eq 85 -and $env:TPSM_TEST_OWNER) { return [pscustomobject]@{ OwningProcess = 200 } }
+    if ($LocalPort -eq 85) { throw 'Apache port must never be controlled by TPSM' }
+    if ($LocalPort -eq 8081 -and $env:TPSM_TEST_OWNER) { return [pscustomobject]@{ OwningProcess = 200 } }
     return @()
 }
 function Get-Command { return [pscustomobject]@{ Source = 'java.exe' } }
 function Get-CimInstance {
     if ($env:TPSM_TEST_OWNER -eq 'foreign') { return [pscustomobject]@{ Name = 'httpd.exe'; CommandLine = 'httpd.exe' } }
-    return [pscustomobject]@{ Name = 'java.exe'; CommandLine = 'java -cp languagetool-server.jar org.languagetool.server.HTTPServer --port 85' }
+    return [pscustomobject]@{ Name = 'java.exe'; CommandLine = 'java -cp languagetool-server.jar org.languagetool.server.HTTPServer --port 8081' }
 }
 function Get-Process {
     $process = [pscustomobject]@{ Id = 200; Handle = 200 }
@@ -77,6 +79,8 @@ function Start-Process {
           [switch]$PassThru, $RedirectStandardOutput, $RedirectStandardError)
     if ($WindowStyle -ne 'Hidden' -or -not $RedirectStandardOutput -or -not $RedirectStandardError) { throw 'Worker is not hidden/logged' }
     if ($FilePath -like '*httpd*') { throw 'Apache must not be a managed worker' }
+    if ($env:LANGUAGETOOL_URL -ne 'http://127.0.0.1:8081/v2/check') { throw 'Wrong spelling endpoint' }
+    if ($global:launched -eq 2 -and ($ArgumentList -join ' ') -notmatch '--port 8081\b') { throw 'Wrong LanguageTool port' }
     if ($global:launched -eq 1 -and $env:SITE_ORIGIN -ne 'https://tpsm.grupo-asicce.com') { throw 'Wrong tunnel origin' }
     $global:launched++
     $process = [pscustomobject]@{ Id = 100 + $global:launched; HasExited = ($env:TPSM_TEST_FAIL -eq '1' -and $global:launched -eq 1); ExitCode = 9 }

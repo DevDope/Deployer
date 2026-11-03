@@ -42,6 +42,15 @@ try {
     foreach ($file in @($python, $waitress, $tunnelBat, $apache, $apacheConf)) {
         if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw ('No existe: ' + $file) }
     }
+    foreach ($directory in @($env:PROD_DIR, $env:TUNNEL_DIR)) {
+        $views = Join-Path $directory 'procesamiento\views.py'
+        if (Test-Path -LiteralPath $views) {
+            $source = [IO.File]::ReadAllText($views)
+            if ($source -match '(?m)^LANGUAGETOOL_URL\s*=\s*["'']http://127\.0\.0\.1:85/v2/check["'']\s*$' -and $env:LT_PORT -ne '85') {
+                throw ('Actualiza LANGUAGETOOL_URL para leer la variable de entorno en ' + $views + '. Apache conserva el puerto 85.')
+            }
+        }
+    }
     foreach ($port in @([int]$env:PROD_PORT, [int]$env:TUNNEL_PORT)) {
         if (Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue) {
             throw ('Puerto ' + $port + ' ocupado. Deten la instancia anterior antes de iniciar TPSM.')

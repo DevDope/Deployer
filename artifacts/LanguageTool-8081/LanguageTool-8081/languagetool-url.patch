@@ -1,0 +1,13 @@
+diff --git a/procesamiento/views.py b/procesamiento/views.py
+index 53b331b..cb9a13c 100644
+--- a/procesamiento/views.py
++++ b/procesamiento/views.py
+@@ -13148,7 +13148,7 @@ def obtener_plantilla_estudio(request, id_estudio):
+         "nombre": row[1]
+     })
+ 
+-LANGUAGETOOL_URL = "http://127.0.0.1:85/v2/check"
++LANGUAGETOOL_URL = os.environ.get("LANGUAGETOOL_URL", "http://127.0.0.1:85/v2/check")
+ 
+ 
+ @require_POST
