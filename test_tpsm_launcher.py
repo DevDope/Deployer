@@ -38,7 +38,28 @@ class TpsmLauncherCheck(unittest.TestCase):
             driver.write_text(r'''
 $global:launched = 0
 $global:closed = @()
-function Get-NetTCPConnection { return @() }
+$global:ltClosed = 0
+function Get-NetTCPConnection {
+    param($State, $LocalPort, $ErrorAction)
+    if ($LocalPort -eq 85 -and $env:TPSM_TEST_OWNER) { return [pscustomobject]@{ OwningProcess = 200 } }
+    return @()
+}
+function Get-Command { return [pscustomobject]@{ Source = 'java.exe' } }
+function Get-CimInstance {
+    if ($env:TPSM_TEST_OWNER -eq 'foreign') { return [pscustomobject]@{ Name = 'httpd.exe'; CommandLine = 'httpd.exe' } }
+    return [pscustomobject]@{ Name = 'java.exe'; CommandLine = 'java -cp languagetool-server.jar org.languagetool.server.HTTPServer --port 85' }
+}
+function Get-Process {
+    $process = [pscustomobject]@{ Id = 200; Handle = 200 }
+    $process | Add-Member ScriptMethod WaitForExit { return $true }
+    $process | Add-Member ScriptMethod Dispose {}
+    return $process
+}
+function Stop-Process {
+    param($InputObject, [switch]$Force, $ErrorAction)
+    if ($InputObject.Id -ne 200) { throw 'Wrong LanguageTool PID' }
+    $global:ltClosed++
+}
 function New-Object {
     param($TypeName)
     if ($TypeName -ne 'Net.Sockets.TcpClient') { throw 'Unexpected object' }
@@ -70,6 +91,11 @@ function taskkill.exe {
 }
 ''' + "\n& '" + str(supervisor).replace("'", "''") + "'\n" + r'''
 $code = $LASTEXITCODE
+if ($env:TPSM_TEST_OWNER -eq 'foreign') {
+    if ($global:launched -ne 0 -or $global:ltClosed -ne 0) { throw 'Foreign process was changed' }
+    exit $code
+}
+if ($env:TPSM_TEST_OWNER -eq 'language' -and $global:ltClosed -ne 1) { throw 'LanguageTool was not restarted' }
 $expected = if ($env:TPSM_TEST_FAIL -eq '1') { 2 } else { 3 }
 if ($global:launched -ne 3 -or $global:closed.Count -ne $expected) { throw 'Missing worker cleanup' }
 exit $code
@@ -85,6 +111,14 @@ exit $code
                                     capture_output=True, text=True, timeout=20, env=env, creationflags=subprocess.CREATE_NO_WINDOW)
             self.assertEqual(failed.returncode, 1, failed.stdout + failed.stderr)
             self.assertIn("prod termino con codigo 9", failed.stdout)
+            env.pop("TPSM_TEST_FAIL")
+            stop.touch()
+            for owner in ("language", "foreign"):
+                env["TPSM_TEST_OWNER"] = owner
+                result = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(driver)],
+                                        capture_output=True, text=True, timeout=20, env=env, creationflags=subprocess.CREATE_NO_WINDOW)
+                self.assertEqual(result.returncode, 0 if owner == "language" else 1, result.stdout + result.stderr)
+                self.assertIn("LanguageTool anterior cerrado" if owner == "language" else "pertenece a otro proceso", result.stdout)
 
     def test_panel_stop_signals_supervisor(self):
         from types import SimpleNamespace

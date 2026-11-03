@@ -21,6 +21,18 @@ function Start-Worker($Name, $Executable, $Arguments, $Directory) {
     return [pscustomobject]@{ Name = $Name; Process = $process }
 }
 
+function Get-LanguageToolOwner([int]$OwnerId) {
+    $owner = Get-CimInstance Win32_Process -Filter ('ProcessId=' + $OwnerId) -ErrorAction Stop
+    if (-not $owner -or $owner.Name -notmatch '^javaw?\.exe$' -or
+        $owner.CommandLine -notmatch 'org\.languagetool\.server\.HTTPServer' -or
+        $owner.CommandLine -notmatch '(?i)(?:^|[\\/\s"])languagetool-server\.jar(?:["\s]|$)') {
+        throw ('El puerto de LanguageTool pertenece a otro proceso, PID ' + $OwnerId + '. No se detuvo.')
+    }
+    $process = Get-Process -Id $OwnerId -ErrorAction Stop
+    $null = $process.Handle
+    return $process
+}
+
 try {
     $python = $env:PROD_PYTHON
     $waitress = $env:PROD_WAITRESS
@@ -33,6 +45,18 @@ try {
     foreach ($port in @([int]$env:PROD_PORT, [int]$env:TUNNEL_PORT)) {
         if (Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue) {
             throw ('Puerto ' + $port + ' ocupado. Deten la instancia anterior antes de iniciar TPSM.')
+        }
+    }
+    $ltJar = Join-Path $env:LT_DIR 'languagetool-server.jar'
+    $ltAvailable = Test-Path -LiteralPath $ltJar -PathType Leaf
+    $ltOwners = @()
+    if ($ltAvailable) {
+        $java = (Get-Command java.exe -ErrorAction Stop).Source
+        $ltOwners = @(Get-NetTCPConnection -State Listen -LocalPort ([int]$env:LT_PORT) -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty OwningProcess -Unique)
+        foreach ($ownerId in $ltOwners) {
+            $checked = Get-LanguageToolOwner $ownerId
+            $checked.Dispose()
         }
     }
     New-Item -ItemType Directory -Path $logs -Force | Out-Null
@@ -76,10 +100,15 @@ try {
     $workers += Start-Worker 'prod' $waitress @('--host=127.0.0.1', ('--port=' + $env:PROD_PORT), '--threads=16', '--max-request-body-size=104857600', '--channel-timeout=900', 'proyecto_suit.wsgi:application') $env:PROD_DIR
     $env:DJANGO_SETTINGS_MODULE = 'proyecto_suit.tunnel_settings'
     $workers += Start-Worker 'tunnel' $env:ComSpec @('/d', '/c', ('call "' + $tunnelBat + '"')) $env:TUNNEL_DIR
-    if (Get-NetTCPConnection -State Listen -LocalPort ([int]$env:LT_PORT) -ErrorAction SilentlyContinue) {
-        Write-Output '[INFO] El puerto de LanguageTool ya esta ocupado. Se conserva ese proceso sin tomar control de el.'
-    } elseif (Test-Path -LiteralPath (Join-Path $env:LT_DIR 'languagetool-server.jar')) {
-        $workers += Start-Worker 'languagetool' 'java.exe' @('-cp', 'languagetool-server.jar', 'org.languagetool.server.HTTPServer', '--port', $env:LT_PORT, '--allow-origin') $env:LT_DIR
+    if ($ltAvailable) {
+        foreach ($ownerId in $ltOwners) {
+            $previous = Get-LanguageToolOwner $ownerId
+            Stop-Process -InputObject $previous -Force -ErrorAction Stop
+            if (-not $previous.WaitForExit(5000)) { throw 'LanguageTool anterior no termino.' }
+            $previous.Dispose()
+            Write-Output ('[INFO] LanguageTool anterior cerrado: PID ' + $ownerId)
+        }
+        $workers += Start-Worker 'languagetool' $java @('-cp', 'languagetool-server.jar', 'org.languagetool.server.HTTPServer', '--port', $env:LT_PORT, '--allow-origin') $env:LT_DIR
     } else { Write-Output '[WARN] No se encontro LanguageTool. Revisa LT_DIR.' }
     Write-Output ('[LOGS] ' + $logs)
     $ready = $false
@@ -96,8 +125,10 @@ try {
                 throw ($worker.Name + ' termino con codigo ' + $worker.Process.ExitCode + '. Revisa ' + $logs)
             }
         }
-        if (-not $ready -and (Test-Port ([int]$env:PROD_PORT)) -and (Test-Port ([int]$env:TUNNEL_PORT))) {
-            Write-Output ('[OK] TPSM responde en PROD y tunel. URL: ' + $env:SITE_ORIGIN)
+        if (-not $ready -and (Test-Port ([int]$env:PROD_PORT)) -and (Test-Port ([int]$env:TUNNEL_PORT)) -and
+            (-not $ltAvailable -or (Test-Port ([int]$env:LT_PORT)))) {
+            $components = if ($ltAvailable) { 'PROD, tunel y LanguageTool' } else { 'PROD y tunel' }
+            Write-Output ('[OK] TPSM responde en ' + $components + '. URL: ' + $env:SITE_ORIGIN)
             $ready = $true
         }
         Start-Sleep -Seconds 1

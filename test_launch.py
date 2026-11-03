@@ -10,6 +10,40 @@ import deployer_panel as panel
 
 
 class LaunchCheck(unittest.TestCase):
+    def test_boot_task_uses_password_stdin_and_keeps_boot_settings_on_start(self):
+        app = {"task": "Deployer_Check", "cwd": "managed_bats", "bat": "managed_bats/Check.bat"}
+        credentials = {"User": "SERVER\\user", "Password": "test-windows-password"}
+        with patch.object(panel, "ps", return_value=SimpleNamespace(returncode=0)) as execute:
+            panel.create_task(app, credentials)
+        script = execute.call_args.args[0]
+        self.assertIn("New-ScheduledTaskTrigger -AtStartup", script)
+        self.assertIn("-LogonType Password", script)
+        self.assertNotIn(credentials["Password"], script)
+        self.assertEqual(json.loads(execute.call_args.kwargs["input"]), credentials)
+        app["autostart"] = True
+        with patch.object(panel, "ps", return_value=SimpleNamespace(returncode=0)) as execute:
+            panel.create_task(app)
+        script = execute.call_args.args[0]
+        self.assertIn("$existing=Get-ScheduledTask", script)
+        self.assertIn("MSFT_TaskBootTrigger", script)
+        self.assertNotIn("Register-ScheduledTask", script)
+        self.assertNotIn("Set-ScheduledTask", script)
+
+    def test_enabling_startup_does_not_save_windows_password(self):
+        config = {"apps": [{"task": "One"}, {"task": "Two"}], "cloudflared_service": "cloudflared"}
+        with patch.object(panel, "sync_bat"), patch.object(panel, "create_task"), patch.object(panel, "save_config"), patch.object(panel, "ps", return_value=SimpleNamespace(returncode=0)) as execute:
+            result = panel.enable_startup(config, "SERVER\\user", "test-windows-password")
+        self.assertTrue(all(app["autostart"] for app in config["apps"]))
+        self.assertNotIn("test-windows-password", json.dumps(config))
+        self.assertIn("-StartupType Automatic", execute.call_args.args[0])
+        self.assertTrue(result.startswith("[OK]"))
+
+    def test_credential_input_reaches_powershell_without_command_line_secret(self):
+        result = panel.ps("$value=[Console]::In.ReadToEnd() | ConvertFrom-Json; if($value.Password.Length -eq 6){'OK'}else{throw 'Missing input'}",
+                          input=json.dumps({"Password": "sample"}))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "OK")
+
     def test_cmd_linked_scripts_are_detected_and_rechecked(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -91,12 +125,14 @@ class LaunchCheck(unittest.TestCase):
                     self.assertEqual(config["apps"][0]["cwd"], str(bat.parent))
                     self.assertEqual(config["apps"][0]["port_mode"], "auto")
                     protected = config["apps"][0]["inference_key_protected"]
+                    config["apps"][0]["autostart"] = True
                     self.assertNotIn(secret, json.dumps(config))
                     self.assertEqual(panel.crypt_secret(panel.base64.b64decode(protected), decrypt=True).decode(), secret)
                     editing = panel.ServiceDialog(ui, config["apps"][0])
                     self.assertEqual(editing.fields["inference_key"].get(), "")
                     editing.save()
                     self.assertEqual(config["apps"][0]["inference_key_protected"], protected)
+                    self.assertTrue(config["apps"][0]["autostart"])
                     bat.write_text('set "PORT=7010"\nset "PUBLIC_URL=https://new.example"\n', encoding="utf-8")
                     card = ui.cards["demo"]
                     with patch.object(panel, "create_task"), patch.object(card, "_run", return_value="requested"):
@@ -148,6 +184,12 @@ class LaunchCheck(unittest.TestCase):
                 self.assertEqual(ui.detail_title.cget("text"), "Cloudflared")
                 self.assertEqual(sum(w.winfo_manager() == "pack" for w in ui.actions.winfo_children()), 4)
                 self.assertEqual(len(ui.service_list.get_children()), len(ui.config_data["apps"]) + 1)
+                dialog = panel.StartupDialog(ui)
+                self.assertEqual(dialog.password.cget("show"), "*")
+                dialog.password.insert(0, "test-windows-password")
+                with patch.object(ui, "bg") as background:
+                    dialog.activate()
+                self.assertIs(background.call_args.args[0], panel.enable_startup)
             finally:
                 ui.destroy()
 

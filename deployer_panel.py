@@ -23,7 +23,7 @@ CONFIG = ROOT / "services.json"
 LOG_DIR = ROOT / "panel_logs"
 MANAGED_BATS = ROOT / "managed_bats"
 ADDRESSES = ROOT / "direcciones.txt"
-VERSION = "v3.8"
+VERSION = "v3.9"
 LOG_DIR.mkdir(exist_ok=True)
 MANAGED_BATS.mkdir(exist_ok=True)
 
@@ -38,13 +38,13 @@ TEXT = "#20252c"
 MUTED = "#66717e"
 
 
-def run(args, timeout=8):
-    return subprocess.run(args, text=True, capture_output=True, timeout=timeout, shell=False,
+def run(args, timeout=8, input=None):
+    return subprocess.run(args, text=True, capture_output=True, timeout=timeout, shell=False, input=input,
                           creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
 
 
-def ps(script, timeout=8):
-    return run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script], timeout)
+def ps(script, timeout=8, input=None):
+    return run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script], timeout, input=input)
 
 
 def load_config():
@@ -316,13 +316,32 @@ def read_tail(paths, lines=120):
         return log, f"No pude leer {log}: {exc}"
 
 
-def create_task(app):
+def create_task(app, credentials=None):
     task = app["task"]
     pythonw = Path(sys.executable).with_name("pythonw.exe")
     if not pythonw.is_file():
         raise FileNotFoundError(f"No existe {pythonw}. Se necesita pythonw para ejecutar sin consola.")
     arguments = subprocess.list2cmdline([str(Path(__file__).resolve()), "--run-task", task])
     quote = lambda value: "'" + str(value).replace("'", "''") + "'"
+    if credentials:
+        registration = (
+            "$credentials=[Console]::In.ReadToEnd() | ConvertFrom-Json;"
+            "if($credentials.User -ine $identity.Name){throw 'Usa la misma cuenta de Windows que ejecuta el panel.'};"
+            "$principal=New-ScheduledTaskPrincipal -UserId $credentials.User -LogonType Password -RunLevel Highest;"
+            "$trigger=New-ScheduledTaskTrigger -AtStartup; $trigger.Delay='PT30S';"
+            f"Register-ScheduledTask -TaskName {quote(task)} -Action $action -Settings $settings -Trigger $trigger "
+            "-User $credentials.User -Password $credentials.Password -RunLevel Highest -Force | Out-Null;"
+        )
+    elif app.get("autostart"):
+        registration = (
+            f"$existing=Get-ScheduledTask -TaskName {quote(task)} -ErrorAction Stop;"
+            "if($existing.Principal.LogonType.ToString() -notin @('Password','1'))"
+            "{throw 'Reactiva el inicio automatico: la tarea no tiene credenciales de arranque.'};"
+            "if($existing.Principal.RunLevel -ne $principal.RunLevel){throw 'Reactiva el inicio automatico con permisos elevados.'};"
+            "$principal=$existing.Principal;"
+        )
+    else:
+        registration = f"Register-ScheduledTask -TaskName {quote(task)} -Action $action -Principal $principal -Settings $settings -Force | Out-Null;"
     script = (
         "$ErrorActionPreference='Stop';"
         "$identity=[Security.Principal.WindowsIdentity]::GetCurrent();"
@@ -333,8 +352,8 @@ def create_task(app):
         f"$action=New-ScheduledTaskAction -Execute {quote(pythonw)} -Argument {quote(arguments)} "
         f"-WorkingDirectory {quote(app_path(app['cwd']))};"
         "$settings=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries "
-        "-ExecutionTimeLimit (New-TimeSpan -Hours 0);"
-        f"Register-ScheduledTask -TaskName {quote(task)} -Action $action -Principal $principal -Settings $settings -Force | Out-Null;"
+        "-ExecutionTimeLimit (New-TimeSpan -Hours 0) -StartWhenAvailable -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1);"
+        + registration +
         f"$registered=Get-ScheduledTask -TaskName {quote(task)};"
         "if(@($registered.Actions).Count -ne 1 -or "
         "$registered.Actions[0].Execute -ne $action.Execute -or "
@@ -342,11 +361,26 @@ def create_task(app):
         "$registered.Actions[0].WorkingDirectory -ne $action.WorkingDirectory -or "
         "$registered.Principal.RunLevel -ne $principal.RunLevel -or "
         "$registered.Principal.LogonType -ne $principal.LogonType)"
-        "{throw 'Windows no guardo la tarea con el lanzador oculto y permisos elevados.'}"
+        "{throw 'La tarea no coincide con el lanzador actual. Reinstala la tarea o reactiva el inicio automatico.'}"
     )
-    r = ps(script)
+    if credentials or app.get("autostart"):
+        script += ";if(-not @($registered.Triggers | Where-Object {$_.CimClass.CimClassName -eq 'MSFT_TaskBootTrigger'}).Count){throw 'Falta el disparador al arrancar Windows. Reactiva el inicio automatico.'}"
+    r = ps(script, timeout=30, input=json.dumps(credentials) if credentials else None)
     if r.returncode:
         raise RuntimeError(r.stderr or r.stdout or f"No se pudo instalar {task}")
+
+
+def enable_startup(config, account, password):
+    for app in config["apps"]:
+        sync_bat(app)
+        create_task(app, {"User": account, "Password": password})
+        app["autostart"] = True
+        save_config(config)
+    service = config.get("cloudflared_service", "cloudflared").replace("'", "''")
+    result = ps(f"Set-Service -Name '{service}' -StartupType Automatic -ErrorAction Stop")
+    if result.returncode:
+        raise RuntimeError("Tareas configuradas, pero Cloudflared no pudo ponerse en automatico: " + result.stderr)
+    return "[OK] Inicio automatico configurado: tareas al arrancar Windows, sin iniciar sesion; Cloudflared automatico."
 
 
 def run_task(name):
@@ -533,6 +567,7 @@ class App(tk.Tk):
         ttk.Button(top, text="Agregar servicio", style="Primary.TButton", command=self.add_service).pack(side="right", padx=(8, 0))
         menu = tk.Menu(self, tearoff=False)
         menu.add_command(label="Instalar todas las tareas", command=self.install_all)
+        menu.add_command(label="Activar inicio automatico...", command=lambda: StartupDialog(self))
         menu.add_separator()
         menu.add_command(label="Exportar diagnostico", command=lambda: self.bg(diagnostic_report, self.config_data))
         options = ttk.Menubutton(top, text="Herramientas", menu=menu)
@@ -666,7 +701,8 @@ class App(tk.Tk):
             app = self.cards[self.selected_key].app
             snap = self.snapshots.get(self.selected_key, {})
             status, color = service_status(snap, app.get("ports", []))
-            self.detail_status.configure(text=f"{status}   |   Tarea: {snap.get('state', 'Sin consultar')}", fg=color)
+            startup = "Automatico" if app.get("autostart") else "Manual"
+            self.detail_status.configure(text=f"{status}   |   Tarea: {snap.get('state', 'Sin consultar')}   |   Inicio: {startup}", fg=color)
             ports = "   ".join(f"{p}: {'activo' if ok else 'cerrado'}" for p, ok in snap.get("statuses", [])) or ("Puertos sin consultar" if app.get("ports") else "Puerto no detectado")
             self.detail_paths.configure(text=ports)
             info = f"BAT: {app_path(app['bat'])}\n\nCarpeta: {app_path(app['cwd'])}\n\nTarea: {app['task']}\n\nURL: {app.get('url', '')}"
@@ -882,6 +918,7 @@ class App(tk.Tk):
     def save_service(self, app, old_key=None):
         if old_key:
             old = next(x for x in self.config_data["apps"] if x["key"] == old_key)
+            app["autostart"] = old.get("autostart", False)
             app["task_dirty"] = old.get("task_dirty", False) or (old["bat"], old["cwd"]) != (app["bat"], app["cwd"])
             self.config_data["apps"] = [app if x["key"] == old_key else x for x in self.config_data["apps"]]
             action = "editado"
@@ -902,6 +939,41 @@ class App(tk.Tk):
         self.render_cards()
         self.refresh()
         self.log(f"[OK] Servicio eliminado del panel: {app['name']}")
+
+
+class StartupDialog(tk.Toplevel):
+    def __init__(self, app_ui):
+        super().__init__(app_ui)
+        self.transient(app_ui)
+        self.title("Inicio automatico sin iniciar sesion")
+        self.configure(bg=BG)
+        self.resizable(False, False)
+        self.app_ui = app_ui
+        account = os.environ.get("USERNAME", "")
+        if os.environ.get("USERDOMAIN"):
+            account = os.environ["USERDOMAIN"] + "\\" + account
+        self.account = tk.StringVar(value=account)
+        ttk.Label(self, text="Cuenta de Windows").grid(row=0, column=0, padx=16, pady=12, sticky="w")
+        ttk.Entry(self, textvariable=self.account, state="readonly", width=42).grid(row=0, column=1, padx=16)
+        ttk.Label(self, text="Contrasena de Windows").grid(row=1, column=0, padx=16, pady=12, sticky="w")
+        self.password = ttk.Entry(self, show="*", width=42)
+        self.password.grid(row=1, column=1, padx=16)
+        self.password.bind("<Return>", lambda e: self.activate())
+        ttk.Button(self, text="Activar", command=self.activate, style="Primary.TButton").grid(row=2, column=1, padx=16, pady=16, sticky="e")
+        self.grab_set()
+        self.password.focus_set()
+
+    def activate(self):
+        password = self.password.get()
+        if not password:
+            messagebox.showerror("Falta contrasena", "Introduce la contrasena de Windows de esta cuenta.", parent=self)
+            return
+        account = self.account.get()
+        self.password.delete(0, "end")
+        self.app_ui.notebook.select(1)
+        self.app_ui.log("[INICIO] Configurando arranque automatico de las tareas y Cloudflared...")
+        self.app_ui.bg(enable_startup, self.app_ui.config_data, account, password)
+        self.destroy()
 
 
 class ServiceDialog(tk.Toplevel):
